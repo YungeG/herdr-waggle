@@ -1,0 +1,3 @@
+# Rich/Textual preview exports retain terminal padding and template whitespace.
+previews/*.txt whitespace=-blank-at-eol
+previews/*.svg whitespace=-blank-at-eol

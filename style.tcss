@@ -1,0 +1,72 @@
+/* Disposable demo: calm surfaces, color for state, no terminal-within-terminal. */
+Screen { background: #101620; color: #c5d1e2; }
+#masthead { height: 3; background: #182130; padding: 0 1; align-vertical: middle; }
+#brand { width: 17; color: #c5eaf8; text-style: bold; height: 1; margin-top: 1; }
+#demo-badge { width: 1fr; color: #e6bd7c; height: 1; margin-top: 1; }
+#masthead Button { height: 3; min-width: 12; margin-left: 1; border: none; background: #243247; }
+#workspace { height: 1fr; }
+#sidebar { width: 23; background: #141d2a; padding: 1; }
+.nav-heading { color: #8c9fb8; height: 1; margin-bottom: 1; }
+#nav-status { height: 6; }
+#nav-project { height: 8; }
+#sidebar OptionList { border: none; background: transparent; padding: 0; }
+#sidebar OptionList > .option-list--option { padding: 0 1; }
+#sandbox-note { color: #697d97; height: auto; margin-top: 1; }
+#main { width: 1fr; padding: 0 1; }
+#context-line { height: 1; color: #a9bbd1; }
+#toolbar { height: 3; }
+#search { width: 1fr; border: tall #31435a; background: #151f2e; }
+#search:focus { border: tall #72bbd4; }
+#toolbar Button { min-width: 10; margin-left: 1; border: none; }
+#content { height: 1fr; }
+#task-region { width: 1fr; }
+#list-heading { height: 1; color: #8398b3; padding-left: 1; }
+#task-list { height: 1fr; border: none; background: transparent; padding: 0; }
+/* Textual 8.2.8 does not count vertical option padding in its line cache. */
+#task-list > .option-list--option { padding: 0 2; }
+OptionList > .option-list--option-highlighted { background: #233a50; color: #e3ecf6; }
+OptionList:focus > .option-list--option-highlighted { background: #294962; color: #ffffff; }
+#empty { height: auto; padding: 2; color: #9cb0c9; }
+#board { width: 1fr; height: 1fr; }
+.lane { width: 1fr; margin-right: 1; background: #151f2c; }
+.lane:last-child { margin-right: 0; }
+.lane-heading { height: 2; padding: 0 1; color: #b6c9dd; text-style: bold; }
+.lane OptionList { height: 1fr; border: none; background: transparent; padding: 0; }
+.lane OptionList > .option-list--option { padding: 0 1; }
+#heading-running { color: #79ccee; }
+#heading-review { color: #d0b0f5; }
+#heading-done { color: #90d4ad; }
+#inspector { width: 52%; max-width: 75; margin-left: 1; padding: 0 2; background: #182332; border-left: solid #30435b; }
+#inspector.full-detail { width: 1fr; max-width: 100%; margin-left: 0; }
+#detail-heading { height: 2; padding-top: 0; }
+#detail-scroll { height: 1fr; }
+#detail-scroll:focus { border-left: solid #72bbd4; }
+#detail-text { height: auto; padding-right: 1; }
+#detail-actions { height: 3; margin-top: 1; }
+#detail-actions Button { min-width: 8; width: 1fr; margin-right: 1; border: none; }
+#context-hint { height: 1; color: #a9c0d9; background: #1a293c; padding: 0 1; }
+Footer { background: #182130; }
+Button { background: #28384e; color: #d5e1ef; }
+Button:focus { text-style: bold underline; tint: #79ccee 15%; }
+Button.-primary { background: #285f73; color: #e2f6fe; }
+Button.-success { background: #2c5a4b; color: #d1f5e3; }
+Button:disabled { opacity: 45%; }
+Dialog { align: center middle; background: #090e17 80%; }
+#dialog { width: 74; max-width: 96%; height: 32; max-height: 94%; padding: 1 2; background: #1a2638; border: round #577c9f; }
+.dialog-title { height: auto; margin-bottom: 1; text-style: bold; color: #d2ecfa; }
+.muted { color: #9bb0c8; height: auto; }
+.field-label { height: 1; margin-top: 1; color: #aec7df; }
+.form-body { height: 1fr; max-height: 26; }
+#task-description, #note { height: 6; min-height: 3; border: tall #3a516b; background: #131e2d; }
+#note { margin-top: 1; }
+Input, Select { background: #131e2d; }
+.dialog-buttons { height: 3; margin-top: 1; align-horizontal: right; }
+.dialog-buttons Button { margin-left: 1; min-width: 12; border: none; }
+.error { height: auto; color: #f5b28e; }
+#dialog.choice-dialog { height: 26; }
+#dialog.note-dialog { height: auto; }
+#choices { height: 1fr; min-height: 3; border: none; background: #131e2d; }
+#choice-query { margin-top: 1; }
+.choice-dialog > #cancel { margin-top: 1; border: none; }
+#path-options { height: 6; border: none; background: #131e2d; padding: 0; }
+#path-options > .option-list--option { padding: 0 1; }
