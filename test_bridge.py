@@ -12,6 +12,7 @@ import time
 import unittest
 from uuid import uuid4
 
+from journal import parse_event
 from launch import Launch, pi_command
 from model import Board, Run
 from runtime import Runtime, publish
@@ -32,13 +33,15 @@ class PiFixture:
         self.process = None
         self.pumps = []
 
-    async def start(self, *, launcher="direct", launch: Launch | None = None):
+    async def start(self, *, launcher="direct", launch: Launch | None = None, extra_extensions: tuple[Path, ...] = ()):
         env = {**os.environ, "PI_CODING_AGENT_DIR": str(self.root / "pi-config"),
                "XDG_STATE_HOME": str(self.root / "state"), "XDG_CONFIG_HOME": str(self.root / "config"),
                "TASKROOM_BRIDGE_DIR": str(self.runtime.root), "TASKROOM_TEST_PROJECT": str(self.project)}
         arguments = ["--mode", "rpc", "-e", str(HERE / "fixture-provider.ts"), "--no-skills", "--no-prompt-templates",
                      "--no-context-files", "--offline", "--session-dir", str(self.root / "sessions"),
                      "--provider", "taskroom-test", "--model", "fixture"]
+        for extension in extra_extensions:
+            arguments.extend(["-e", str(extension)])
         if launch is not None:
             position = arguments.index("--session-dir")
             del arguments[position:position + 2]
@@ -195,6 +198,50 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
         assert replayed is not None
         self.assertEqual(asdict(replayed), asdict(result))
 
+    async def test_key_journal_keeps_report_snapshots_and_original_session_not_tool_noise(self):
+        board, task, run = await self.prepared_run("HISTORY")
+        self.fixture.runtime.dispatch(run)
+        result = await self.fixture.result(run)
+        self.assertEqual((result.state, result.delivery), ("finished", "full"))
+        events = [parse_event(value) for value in result.events]
+        self.assertTrue(events and all(event is not None for event in events), "New bridge history must persist typed source-stamped records.")
+        typed = [event for event in events if event is not None]
+        origins = [event for event in typed if event.kind == "origin"]
+        self.assertEqual(len(origins), 1)
+        self.assertTrue(origins[0].text.startswith(self.temp.name))
+        self.assertTrue(Path(origins[0].text).is_file())
+        self.assertEqual({event.run_id for event in typed}, {run.id})
+        self.assertTrue(all(0 < event.seq <= result.seq for event in typed))
+        reports = [event for event in typed if event.report is not None]
+        self.assertEqual([event.kind for event in reports], ["progress", "full"])
+        first, final = reports[0].report, reports[-1].report
+        assert first and final and final.brief
+        self.assertEqual(first.remaining, "仍需最终核对")
+        self.assertNotEqual(first.summary, final.summary)
+        self.assertEqual((final.summary, final.checks, final.remaining), (result.summary, result.checks, result.remaining))
+        self.assertEqual(final.brief.actions, ["写入隔离测试文件"])
+        self.assertFalse(any(event.text.startswith(("工具开始", "工具返回成功", "Pi ·")) for event in typed))
+        board.ingest(result)
+        with Store(Path(self.temp.name) / "history.sqlite3") as store:
+            store.load()
+            store.save(board)
+            restored = store.load()
+            self.assertEqual(restored.runs[run.id].events, result.events)
+        self.assertEqual(json.loads((self.fixture.project / "fixture-result.json").read_text())["counter"], 1)
+        self.assertTrue(task.can_accept)
+
+    async def test_report_without_optional_brief_remains_compatible(self):
+        board, task, run = await self.prepared_run("FULL_LEGACY")
+        self.fixture.runtime.dispatch(run)
+        result = await self.fixture.result(run)
+        self.assertEqual((result.state, result.delivery), ("finished", "full"))
+        reports = [event.report for value in result.events if (event := parse_event(value)) is not None and event.report is not None]
+        self.assertEqual(len(reports), 1)
+        self.assertIsNone(reports[0].brief)
+        self.assertEqual(reports[0].summary, result.summary)
+        board.ingest(result)
+        self.assertTrue(task.can_accept)
+
     async def prepared_run(self, title="FULL"):
         agent = await self.fixture.connect()
         assert agent is not None
@@ -264,14 +311,15 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
         result = await self.fixture.result(run)
         self.assertEqual((result.state, result.delivery), ("finished", "partial"))
         self.assertIn("工具", result.remaining)
-        self.assertTrue(any("工具失败" in event for event in result.events))
+        self.assertTrue(any((event := parse_event(value)) is not None and event.kind == "invalidated" and "完整报告之后" in event.text for value in result.events))
         board.ingest(result)
         self.assertFalse(task.can_accept)
 
     async def test_stop_only_owned_active_run_waits_for_settled(self):
         board, task, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        working = await self.fixture.result(run, lambda result: any("工具开始" in event for event in result.events))
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
+        working = await self.fixture.result(run, lambda result: result.state == "working")
         self.assertEqual(working.state, "working")
         board.ingest(working)
         self.fixture.runtime.stop(working)
@@ -287,7 +335,8 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_busy_pi_rejects_second_attempt_and_crash_stays_unknown(self):
         _, _, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        working = await self.fixture.result(run, lambda result: any("工具开始" in event for event in result.events))
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
+        working = await self.fixture.result(run, lambda result: result.state == "working")
         another = Run(str(uuid4()), 2, run.agent_id, run.session_id, run.cwd, "FULL", "", "")
         self.raw_command(another)
         rejected = await self.fixture.result(another)
@@ -354,7 +403,7 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_extra_input_loses_ownership_and_bridge_refuses_to_stop(self):
         board, task, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        await self.fixture.result(run, lambda result: any("工具开始" in event for event in result.events))
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
         response = await self.fixture.request("prompt", message="Independent human input: do not run another fixture effect.", streamingBehavior="steer")
         self.assertTrue(response["success"], response)
         unowned = await self.fixture.result(run, lambda result: any("收到额外输入" in event for event in result.events))

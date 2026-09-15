@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from journal import encoded_event
 from model import Board, Run, sample_board
 from runtime import Agent, BridgeError, Runtime, bridge_root, canonical_directory, install_bridge, private_dir, publish, read_json
 from store import APPLICATION_ID, StorageError, Store, decode, encode
@@ -112,6 +113,58 @@ class RunTests(unittest.TestCase):
                 raw["tasks"][0]["run_id"] = str(uuid4())
             with self.assertRaises(StorageError):
                 decode(json.dumps(raw))
+
+
+class SessionLocationTests(unittest.TestCase):
+    def test_original_session_header_is_verified_without_reading_or_changing_transcript(self):
+        from runtime import locate_session
+        with TemporaryDirectory(prefix="waggle-session-location-") as directory:
+            root = Path(directory)
+            _, _, run = prepared_board(str(root))
+            file = root / "original.jsonl"
+            header = {"type": "session", "version": 3, "id": run.session_id, "cwd": str(root)}
+            body = json.dumps(header).encode() + b"\n" + b"not a transcript to parse\n" * 50000
+            file.write_bytes(body)
+            run.seq = 1
+            run.events = [encoded_event("origin", str(file), source="system", run_id=run.id, seq=1)]
+            before = deepcopy(run)
+            result = locate_session(run)
+            self.assertIn("已核对原会话", result)
+            self.assertIn(str(file), result)
+            self.assertIn(run.session_id, result)
+            self.assertIn(f"RUN_ID={run.id}", result)
+            self.assertIn("不会切换", result)
+            self.assertEqual(file.read_bytes(), body)
+            self.assertEqual(run, before)
+
+    def test_missing_legacy_ephemeral_and_unsafe_locations_never_guess_or_create(self):
+        from runtime import locate_session
+        with TemporaryDirectory(prefix="waggle-session-reject-") as directory:
+            root = Path(directory)
+            _, _, run = prepared_board(str(root))
+            self.assertIn("未保存原会话路径", locate_session(run))
+            valid = root / "valid.jsonl"
+            valid.write_text(json.dumps({"type": "session", "id": run.session_id, "cwd": str(root)}) + "\n")
+            link = root / "link.jsonl"
+            link.symlink_to(valid)
+            fifo = root / "pipe"
+            os.mkfifo(fifo)
+            invalid = root / "invalid.jsonl"
+            invalid.write_text("x" * 17000 + "\n")
+            wrong = root / "wrong.jsonl"
+            wrong.write_text(json.dumps({"type": "session", "id": str(uuid4()), "cwd": str(root)}) + "\n")
+            wrong_cwd = root / "wrong-cwd.jsonl"
+            wrong_cwd.write_text(json.dumps({"type": "session", "id": run.session_id, "cwd": str(root.parent)}) + "\n")
+            for path in ("", "relative.jsonl", str(root / "missing.jsonl"), str(link), str(fifo), str(root), str(invalid), str(wrong), str(wrong_cwd)):
+                with self.subTest(path=path):
+                    run.seq = 1
+                    run.events = [encoded_event("origin", path, source="system", run_id=run.id, seq=1)]
+                    result = locate_session(run)
+                    self.assertNotIn("已核对原会话", result)
+                    self.assertIn(run.session_id, result)
+                    self.assertIn(run.id, result)
+            self.assertFalse((root / "missing.jsonl").exists())
+            self.assertFalse((root / "bridges").exists())
 
 
 class MigrationTests(unittest.TestCase):

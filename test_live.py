@@ -15,10 +15,11 @@ from uuid import uuid4
 
 from textual import events
 from textual.containers import VerticalScroll
-from textual.widgets import Button, Input, OptionList, Static, TextArea
+from textual.widgets import Button, Input, OptionList, Static, TextArea, Tree
 
 from app import Choice, Confirm, Note, ProjectForm, TaskForm, TaskRoom
 from model import Board
+from records import TaskRecords
 from runtime import Agent, Runtime, private_dir, publish
 from store import Store
 from test_bridge import PiFixture
@@ -80,6 +81,23 @@ class LivePiUI(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((current.state, current.delivery), ("finished", "full"))
                 self.assertTrue(app.board.tasks[1].can_accept)
                 self.assertIn("自报", str(app.query_one("#detail-text", Static).content))
+                self.assertIn("写入隔离测试文件", str(app.query_one("#detail-text", Static).content))
+                await pilot.press("right")
+                await pilot.click("#activity-button")
+                assert isinstance(app.screen, TaskRecords)
+                records = app.screen
+                tree = records.query_one("#records-tree", Tree)
+                report = next(node for node in tree.root.children[0].children if node.data and node.data[1] and node.data[1].kind == "full")
+                tree.select_node(report)
+                await pilot.pause()
+                self.assertIn("Offline fixture report", str(records.query_one("#record-body", Static).content))
+                await pilot.click("#locate-session")
+                await wait_ui(pilot, lambda: isinstance(app.screen, Confirm))
+                assert isinstance(app.screen, Confirm)
+                self.assertIn("已核对原会话", app.screen.body)
+                self.assertIn(current.session_id, app.screen.body)
+                self.assertIn(current.id, app.screen.body)
+                await pilot.press("escape", "escape")
                 self.assertEqual(app.selected_id, 1)
                 self.assertEqual(len(app.board.runs), 1)
         with Store(self.path) as store:
@@ -188,8 +206,8 @@ class LiveFailureUI(unittest.IsolatedAsyncioTestCase):
     def result(self, run, state="working", seq=3):
         incoming = deepcopy(run)
         incoming.state, incoming.seq = state, seq
-        incoming.summary = "Pi 自报进展"
-        incoming.events = [f"进展 {index} · 一段较长的中文说明" for index in range(40)]
+        incoming.summary = "Pi 自报进展\n" + "一段较长的交付说明。\n" * 40
+        incoming.events = ["执行者报告 · progress · 旧版进展摘录。"]
         if state == "finished":
             incoming.delivery, incoming.checks = "full", ["Agent 自报检查；未独立核验"]
         file = self.endpoint / "runs" / f"{run.id}.json"
@@ -291,7 +309,9 @@ class LiveFailureUI(unittest.IsolatedAsyncioTestCase):
         self.result(run)
         async with app.run_test(size=(120, 30)) as pilot:
             await wait_ui(pilot, lambda: app.board.runs[run.id].seq == 3)
-            await pilot.press("enter", "pagedown")
+            await pilot.press("enter")
+            await pilot.click("#detail-toggle")
+            await pilot.press("pagedown")
             await pilot.pause()
             scroll = app.query_one("#detail-scroll", VerticalScroll)
             self.assertGreater(scroll.scroll_y, 0)

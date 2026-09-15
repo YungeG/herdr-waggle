@@ -44,14 +44,23 @@ export default function (pi: ExtensionAPI) {
                 if (text.includes("RUN_ID=")) { prompt = text; start = i; break; }
             }
             const runId = /RUN_ID=([0-9a-f-]{36})/.exec(prompt)?.[1];
-            const effectDone = messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "taskroom_fixture_effect");
-            const extraInput = messages.slice(start + 1).some(message => message.role === "user");
+            const compactions = Number(/FIXTURE_COMPACTED=(\d+)/.exec(prompt)?.[1] || 0);
+            const effectDone = compactions > 0 || messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "taskroom_fixture_effect");
+            const compactTask = prompt.includes("Task: COMPACT");
+            const compactAttempted = messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "context_compact");
+            const extraInput = messages.slice(start + 1).some(message => {
+                if (message.role !== "user") return false;
+                const text = typeof message.content === "string" ? message.content : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+                return !compactTask || !text.startsWith("context_compact ");
+            });
             const confirmation = prompt.includes("Task: CONFIRM");
             const noReport = prompt.includes("Task: NO_REPORT");
             const partial = prompt.includes("Task: PARTIAL");
             const blocked = prompt.includes("Task: BLOCKED");
             const slow = prompt.includes("Task: SLOW");
             const lateFailure = prompt.includes("Task: LATE_FAILURE");
+            const taskTitle = /^Task: (.+)$/m.exec(prompt)?.[1] || "COMPACT";
+            const slowContinuation = taskTitle === "COMPACT_SLOW" && compactions > 0 && !messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "taskroom_fixture_effect");
             const output: AssistantMessage = {
                 role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
                 usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -60,11 +69,20 @@ export default function (pi: ExtensionAPI) {
             };
             if (!runId || extraInput || (effectDone && noReport)) output.content = [{ type: "text", text: "Offline fixture ended without final delivery." }];
             else if (!effectDone) output.content = [{ type: "toolCall", id: `effect-${runId}`, name: "taskroom_fixture_effect", arguments: { slow, fail: false, confirm: confirmation } }];
+            else if (slowContinuation) output.content = [{ type: "toolCall", id: `continued-effect-${runId}`, name: "taskroom_fixture_effect", arguments: { slow: true, fail: false } }];
+            else if (compactTask && !compactAttempted && compactions < (prompt.includes("Task: COMPACT_TWICE") ? 2 : 1)) {
+                output.content = [{ type: "toolCall", id: `compact-${runId}-${compactions}`, name: "context_compact", arguments: {
+                    target: "root", summary: `RUN_ID=${runId}\nTask: ${taskTitle}\nFIXTURE_COMPACTED=${compactions + 1}\nThe fixture effect already happened once; continue with the report, do not replay the effect.`,
+                } }];
+            }
             else {
-                output.content = [{ type: "toolCall", id: `report-${runId}`, name: "taskroom_report", arguments: {
-                    run_id: runId, kind: blocked ? "blocked" : partial ? "partial" : "full", summary: "Offline fixture report · 中文成果已写入",
+                const progress = taskTitle === "HISTORY" && !messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "taskroom_report");
+                output.content = [{ type: "toolCall", id: `report-${runId}-${progress ? "progress" : "final"}`, name: "taskroom_report", arguments: {
+                    run_id: runId, kind: progress ? "progress" : blocked ? "blocked" : partial ? "partial" : "full",
+                    summary: progress ? "第一份报告：已写入隔离文件，仍需最终核对。" : "Offline fixture report · 中文成果已写入",
                     checks: ["Fixture tool observed counter; integration test independently reads the file."],
-                    remaining: partial ? "第二阶段尚未完成" : blocked ? "等待测试输入" : "",
+                    remaining: progress ? "仍需最终核对" : partial ? "第二阶段尚未完成" : blocked ? "等待测试输入" : "",
+                    ...(taskTitle === "FULL_LEGACY" ? {} : { brief: { actions: ["写入隔离测试文件"], outcome: "已保存中文样例成果", verification: "自报计数器结果；集成测试另行读文件核实" } }),
                 } }];
                 if (lateFailure && !messages.slice(start + 1).some(message => message.role === "toolResult" && message.toolName === "taskroom_report")) {
                     output.content.push({ type: "toolCall", id: `fail-${runId}`, name: "taskroom_fixture_effect", arguments: { slow: false, fail: true } });
@@ -72,6 +90,12 @@ export default function (pi: ExtensionAPI) {
             }
             const toolUse = output.content.some(part => part.type === "toolCall");
             output.stopReason = toolUse ? "toolUse" : "stop";
+            if (taskTitle === "PROVIDER_ERROR" || (taskTitle === "COMPACT_PROVIDER_ERROR" && compactions > 0)) {
+                output.content = []; output.stopReason = "error"; output.errorMessage = "Deliberate offline provider failure";
+                stream.push({ type: "error", reason: "error", error: output });
+                stream.end();
+                return stream;
+            }
             stream.push({ type: "start", partial: output });
             for (let i = 0; i < output.content.length; i++) {
                 const part = output.content[i];

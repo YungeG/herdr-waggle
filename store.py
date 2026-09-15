@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sqlite3
 
+from journal import validate_events
 from model import AGENTS, PROJECTS, RUNS, STATUSES, Board, Run, Task, valid_uuid
 
 APPLICATION_ID = 0x54524D31
@@ -43,6 +44,9 @@ def _tasks(board: Board, rows: object, *, legacy: bool = False) -> None:
             raise StorageError("模拟任务的执行者/执行 ID 无效。")
         if task.execution == "pi" and task.agent and not valid_uuid(task.agent):
             raise StorageError("Pi 执行者身份无效。")
+        for event in validate_events(task.events):
+            if event.source not in {"human", "system", "simulation"} or (not event.run_id and event.seq):
+                raise StorageError("任务关键记录来源或修订锚点无效。")
         board.tasks[task.id] = task
 
 
@@ -90,6 +94,11 @@ def decode(data: str, *, legacy: bool = False) -> Board:
                 active_agents.add(run.agent_id)
                 active_tasks.add(run.task_id)
         for task in board.tasks.values():
+            for event in validate_events(task.events):
+                if event.run_id:
+                    owner = board.runs.get(event.run_id)
+                    if not owner or owner.task_id != task.id or event.seq > owner.seq:
+                        raise StorageError("任务关键记录指向不存在/其他任务的执行或未来修订。")
             if task.execution != "pi":
                 continue
             run = board.runs.get(task.run_id)

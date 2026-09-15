@@ -9,6 +9,7 @@ import subprocess
 import time
 from uuid import uuid4
 
+from journal import check_history, validate_events
 from model import Run, valid_uuid
 
 MAX_BYTES = 1024 * 1024
@@ -43,6 +44,41 @@ def canonical_directory(value: str) -> str:
         return str(canonical)
     except OSError as error:
         raise BridgeError(f"目录不可用：{error}") from error
+
+
+def locate_session(run: Run) -> str:
+    """Verify only the captured original file's bounded header; never resume Pi."""
+    identity = f"原项目目录：{run.cwd}\n原 Session：{run.session_id}\nRUN_ID={run.id}"
+    path_text = ""
+    try:
+        events = validate_events(run.events, run_id=run.id, seq=run.seq)
+        origin = next((event for event in events if event.kind == "origin"), None)
+        path_text = origin.text if origin else ""
+        if not path_text:
+            raise BridgeError("未保存原会话路径（旧记录或临时会话）；不会寻找执行者现在的会话。")
+        path = Path(path_text)
+        if not path.is_absolute():
+            raise BridgeError("原会话路径不是绝对路径。")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise BridgeError("原会话必须是当前用户拥有的普通文件，不接受链接或管道。")
+            line = stream.readline(16 * 1024 + 1)
+        if len(line) > 16 * 1024:
+            raise BridgeError("原会话头超过 16 KiB，不读取正文。")
+        header = json.loads(line)
+        if not isinstance(header, dict) or header.get("type") != "session" or header.get("id") != run.session_id:
+            raise BridgeError("文件头与原 Session 不匹配。")
+        if not isinstance(header.get("cwd"), str) or canonical_directory(header["cwd"]) != run.cwd:
+            raise BridgeError("文件头与原项目目录不匹配。")
+        status = "已核对原会话的文件头；未读取或恢复对话。"
+    except (OSError, ValueError) as error:
+        status = f"无法核对原会话：{error}"
+    return (f"{status}\n\n{identity}\n原会话文件：{path_text or '未知'}\n\n"
+            "同一 Session 可执行多个任务；原任务消息以以上 RUN_ID 标识。\n"
+            "请在原 Pi 中自行核对 /session，再搜索对应 RUN_ID。/tree 中选择条目会改变对话位置；仅查看时用 Esc 返回。\n"
+            "这里只提供定位信息，不会切换、恢复或新建会话，不会发送任务。")
 
 
 def _private(info: os.stat_result, *, directory: bool) -> None:
@@ -208,6 +244,7 @@ class Runtime:
             return None  # Publication is not an acknowledgement; never infer failure/finish.
         if incoming.identity != run.identity:
             raise BridgeError("Pi 返回的执行身份不匹配，拒绝应用。")
+        check_history(run.events, incoming.events)
         return incoming
 
 

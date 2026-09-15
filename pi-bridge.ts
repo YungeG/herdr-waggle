@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { appendKeyEvent, validateEvents, type Report } from "./journal.ts";
 
 const MAX_BYTES = 1024 * 1024;
 const uuid = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
@@ -78,6 +79,7 @@ function parseRun(record: unknown): Run {
     const run = row as unknown as Run;
     if (![run.id, run.agent_id, run.session_id].every(uuid) || !path.isAbsolute(run.cwd) || !run.title.trim()) throw new Error("Invalid run identity.");
     if (!["queued", "working", "waiting", "finished", "failed", "stopped", "interrupted", "abandoned"].includes(run.state) || !["", "progress", "blocked", "partial", "full"].includes(run.delivery)) throw new Error("Invalid run state.");
+    validateEvents(run.events, run.id, run.seq);
     return run;
 }
 function rootDirectory() {
@@ -96,6 +98,18 @@ export default function (pi: ExtensionAPI) {
     let active: Run | undefined;
     let acknowledged = false, stopRequested = false, ownershipLost = false, broken = false;
     let assistantError = "", promptDepth = 0, lastHeartbeat = 0;
+    // pi-context intentionally settles before its deferred same-session continuation.
+    // Keep an in-memory receipt, never revive a terminal run or adopt a new session.
+    let compaction: { callId: string; origin: string; summary: string; target?: string; armed: boolean; navigated: boolean } | undefined;
+    function hasCompactionReceipt(ctx: ExtensionContext, fromId?: string): boolean {
+        const pending = compaction;
+        if (!pending) return false;
+        const branch = ctx.sessionManager.getBranch(fromId);
+        const origin = branch.findIndex(entry => entry.id === pending.origin);
+        return origin >= 0 && branch.some((entry, index) => index > origin && entry.type === "message" &&
+            entry.message.role === "toolResult" && entry.message.toolCallId === pending.callId &&
+            entry.message.toolName === "context_compact" && !entry.message.isError);
+    }
 
     const notify = (message: string, error = false) => context?.ui.notify(`Taskroom: ${message}`, error ? "error" : "info");
     const idle = () => Boolean(context?.isIdle() && !context.hasPendingMessages() && context.ui.getEditorText().length === 0);
@@ -112,10 +126,8 @@ export default function (pi: ExtensionAPI) {
         });
         lastHeartbeat = Date.now();
     }
-    function save(run: Run, event?: string, exclusive = false) {
-        if (event) run.events.push(event.slice(0, 800));
-        // ponytail: bounded per-run journal; keep the newest 119 events plus a truncation notice.
-        if (run.events.length > 120) run.events = ["较早进展已截断；完整工具记录请查看原 Pi 会话。", ...run.events.slice(-119)];
+    function save(run: Run, kind?: string, text = "", exclusive = false, report: Report | null = null) {
+        if (kind) run.events = appendKeyEvent(run.events, kind, text, run.id, run.seq + 1, report);
         run.seq += 1;
         writeJSON(runFile(run.id), run, exclusive);
     }
@@ -131,15 +143,19 @@ export default function (pi: ExtensionAPI) {
     }
     function reject(run: Run, reason: string, state: RunState = "failed") {
         run.state = state; run.summary = reason; run.delivery = ""; run.checks = []; run.remaining = run.requirements;
-        save(run, reason, true);
+        save(run, state, reason, true);
     }
     function requestAbort() {
         if (!context || !active || !acknowledged || ownershipLost || context.hasPendingMessages()) {
-            if (active) save(active, "停止尚未执行：未确认归属或存在额外输入，请到 Pi 核实；不会终止其他工作。");
+            if (active) save(active, "warning", "停止尚未执行：未确认归属或存在额外输入，请到 Pi 核实；不会终止其他工作。");
+            return;
+        }
+        if (compaction) {
+            save(active, "warning", "停止尚未执行：上下文压缩正在交接，无法取消外部扩展的待续接回调；请在 Pi 核实，续接后再确认停止。");
             return;
         }
         stopRequested = true;
-        save(active, "收到人工停止请求 · 正在等待 Pi 完全空闲");
+        save(active, "stop_requested", "收到人工停止请求 · 正在等待 Pi 完全空闲");
         context.abort(); // Pi returns void; only agent_settled confirms completion.
     }
     function dispatch(run: Run, expires: number) {
@@ -153,17 +169,17 @@ export default function (pi: ExtensionAPI) {
         if (run.title.length > 300 || run.description.length > 20000 || run.requirements.length > 6000) return reject(run, "任务说明超出桥接上限；请缩短后另行派发。");
         if (!context || !matches(context) || run.cwd !== cwd || fs.realpathSync(run.cwd) !== cwd) return reject(run, "精确项目目录或 Pi 会话已改变；未执行。");
         if (active || !idle()) return reject(run, "Pi 正忙、有待处理消息或编辑器未清空；未执行。");
-        save(run, "Pi 已预留执行身份；等待对应任务消息确认", true);
-        active = run; acknowledged = false; stopRequested = false; ownershipLost = false; assistantError = ""; promptDepth = 0;
+        save(run, "origin", context.sessionManager.getSessionFile() || "", true);
+        active = run; acknowledged = false; stopRequested = false; ownershipLost = false; assistantError = ""; promptDepth = 0; compaction = undefined;
         heartbeat();
         pi.sendMessage({
             customType: "taskroom-task", display: true, details: { runId: run.id },
-            content: `Taskroom task (explicit human dispatch)\nRUN_ID=${run.id}\nProject: ${cwd}\nTask: ${run.title}\n\n${run.description}\n\nRework / remaining requirements:\n${run.requirements || "None"}\n\nWork only on this task in the exact project directory. Keep ordinary Pi approval gates. Use taskroom_report with this run_id for progress and a final blocked, partial or full report. Full requires concrete checks/evidence and no remaining work; do not label unrun tests as passed. A report and turn end are NOT human acceptance. If work is blocked, report why rather than inventing results.`,
+            content: `Taskroom task (explicit human dispatch)\nRUN_ID=${run.id}\nProject: ${cwd}\nTask: ${run.title}\n\n${run.description}\n\nRework / remaining requirements:\n${run.requirements || "None"}\n\nWork only on this task in the exact project directory. Keep ordinary Pi approval gates. Use taskroom_report with this run_id for progress and a final blocked, partial or full report. Full requires concrete checks/evidence and no remaining work; do not label unrun tests as passed. Also provide brief: actions (1-3 concrete short actions, each <=100 characters), outcome (<=160 characters), verification (<=160 characters, explicitly say unrun/unverified checks). Keep summary as the complete structured report with line breaks, and checks as concrete evidence. Never infer success from tool counts or hide remaining work in a brief. A report and turn end are NOT human acceptance. If work is blocked, report why rather than inventing results.`,
         }, { triggerTurn: true });
     }
     function stop(run: Run, expires: number) {
         if (Date.now() > expires) {
-            if (active?.id === run.id) save(active, "停止请求已过期；请重新确认停止。");
+            if (active?.id === run.id) save(active, "warning", "停止请求已过期；请重新确认停止。");
             return;
         }
         if (fs.existsSync(runFile(run.id))) {
@@ -204,12 +220,12 @@ export default function (pi: ExtensionAPI) {
         timer = undefined;
         if (active) {
             active.state = "interrupted"; active.delivery = ""; active.summary = `Pi 连接结束 (${reason})；没有确认完成。`;
-            guarded(() => { if (active) save(active, active.summary); });
+            guarded(() => { if (active) save(active, "interrupted", active.summary); });
             active = undefined;
         }
         guarded(() => heartbeat(false));
         context?.ui.setStatus("taskroom", undefined);
-        endpoint = ""; agentId = ""; sessionId = ""; cwd = ""; broken = false;
+        endpoint = ""; agentId = ""; sessionId = ""; cwd = ""; broken = false; compaction = undefined;
     }
 
     function activate(ctx: ExtensionContext, exact: string, session: string, id: string = randomUUID()) {
@@ -283,14 +299,22 @@ export default function (pi: ExtensionAPI) {
             summary: Type.String({ minLength: 1, maxLength: 6000 }),
             checks: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), { maxItems: 32 }),
             remaining: Type.String({ maxLength: 6000 }),
+            brief: Type.Optional(Type.Object({
+                actions: Type.Array(Type.String({ minLength: 1, maxLength: 100 }), { minItems: 1, maxItems: 3 }),
+                outcome: Type.String({ minLength: 1, maxLength: 160 }),
+                verification: Type.String({ minLength: 1, maxLength: 160 }),
+            }, { additionalProperties: false })),
         }),
         async execute(_id, params, _signal, _update, ctx) {
             if (!active || broken || !acknowledged || ownershipLost || stopRequested || active.id !== params.run_id || !matches(ctx)) throw new Error("No matching active Taskroom run; report rejected.");
+            if (compaction) throw new Error("Taskroom context handoff is pending; wait for its verified continuation before reporting.");
             if (!params.summary.trim() || params.checks.some(check => !check.trim())) throw new Error("Report text/evidence must be nonempty.");
             if (params.kind === "full" && (!params.checks.length || params.remaining.trim())) throw new Error("Full delivery requires evidence and no remaining work.");
             if (["blocked", "partial"].includes(params.kind) && !params.remaining.trim()) throw new Error("Blocked/partial delivery requires remaining work or a reason.");
+            if (params.brief && (!params.brief.actions.every(action => action.trim()) || !params.brief.outcome.trim() || !params.brief.verification.trim())) throw new Error("Explicit report brief must be nonempty.");
             active.delivery = params.kind; active.summary = params.summary.trim(); active.checks = params.checks; active.remaining = params.remaining.trim();
-            try { save(active, `执行者报告 · ${params.kind} · ${active.summary}`); }
+            const report: Report = { summary: active.summary, checks: active.checks, remaining: active.remaining, brief: params.brief ?? null };
+            try { save(active, params.kind, `执行者报告 · ${params.kind}`, false, report); }
             catch (error) { failClosed(error); throw error; }
             return { content: [{ type: "text", text: "报告已保存；只有 Pi 完全空闲后才可进入人工验收。" }], details: { runId: active.id, kind: params.kind }, terminate: params.kind !== "progress" };
         },
@@ -301,38 +325,70 @@ export default function (pi: ExtensionAPI) {
         const message = event.message;
         if (message.role === "custom" && message.customType === "taskroom-task" && (message.details as { runId?: string } | undefined)?.runId === active.id) {
             acknowledged = true; active.state = "working";
-            save(active, "Pi 已确认对应任务消息 · 开始执行");
+            save(active, "acknowledged", "Pi 已确认对应任务消息 · 开始执行");
+        } else if (acknowledged && message.role === "custom" && message.customType === "pi-context") {
+            if (stopRequested || ownershipLost) return;
+            if (!compaction?.armed) {
+                ownershipLost = true; active.delivery = "";
+                save(active, "invalidated", "Pi 收到未经本轮请求的上下文续接；不接管该输入，也不接受本轮交付。");
+                return;
+            }
+            const text = typeof message.content === "string" ? message.content : message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+            const continued = compaction.navigated && text.startsWith("context_compact complete.") &&
+                ctx.sessionManager.getBranch().some(entry => entry.id === compaction?.target);
+            const unchanged = !compaction.target && /^(context_compact cancelled:|context_compact failed:)/.test(text) && hasCompactionReceipt(ctx);
+            if (!matches(ctx) || (!continued && !unchanged)) throw new Error("Cannot verify the pi-context continuation; task binding remains uncertain.");
+            compaction = undefined; assistantError = ""; active.state = promptDepth ? "waiting" : "working";
+            save(active, continued ? undefined : "warning", "上下文压缩取消/失败 · 原分支续接已核验，不重放任务");
+            heartbeat();
         } else if (acknowledged && message.role === "assistant") {
             assistantError = ["error", "aborted"].includes(message.stopReason) ? message.errorMessage || message.stopReason : "";
-            const text = message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
-            if (text || assistantError) save(active, assistantError ? `Pi 响应错误 · ${assistantError}` : `Pi · ${text}`);
+            if (assistantError) save(active, "warning", `Pi 响应错误 · ${assistantError}`);
         }
     }));
-    pi.on("tool_execution_start", event => guarded(() => {
-        if (active && acknowledged && !broken) save(active, `工具开始 · ${event.toolName}`);
+    pi.on("tool_call", (event, ctx) => {
+        if (!active || !acknowledged || event.toolName !== "context_compact") return;
+        if (broken || stopRequested || ownershipLost || compaction || !matches(ctx)) return { block: true, reason: "Taskroom cannot authorize another context handoff in this state." };
+        const origin = ctx.sessionManager.getLeafId();
+        if (!origin || typeof event.input.summary !== "string") return { block: true, reason: "Invalid Taskroom context handoff." };
+        // Reserve before execution too: another tool_result handler may await UI/I/O.
+        compaction = { callId: event.toolCallId, origin, summary: event.input.summary, armed: false, navigated: false };
+    });
+    pi.on("tool_result", (event, ctx) => guarded(() => {
+        if (!active || !acknowledged || broken || event.toolName !== "context_compact" || event.toolCallId !== compaction?.callId) return;
+        if (event.isError || !event.content.some(part => part.type === "text" && part.text === "compact start")) {
+            compaction = undefined;
+            return;
+        }
+        if (!matches(ctx)) throw new Error("Compaction changed the Taskroom session or directory.");
+        compaction.armed = true;
+        const invalidated = ["full", "partial", "blocked"].includes(active.delivery);
+        active.delivery = "";
+        save(active, invalidated ? "invalidated" : undefined, "上下文交接使此前交付失效；需在续接后重新报告，尚未结束任务");
     }));
     pi.on("tool_execution_end", event => guarded(() => {
-        if (!active || !acknowledged || broken) return;
-        if (event.isError && active.delivery === "full") {
+        if (!active || !acknowledged || broken || !event.isError) return;
+        const invalidated = active.delivery === "full";
+        if (invalidated) {
             active.delivery = "partial"; active.remaining = `完整报告之后工具 ${event.toolName} 失败，需要重新核实交付。`;
         }
-        save(active, `工具${event.isError ? "失败" : "返回成功"} · ${event.toolName}（不等于测试已验证）`);
+        save(active, invalidated ? "invalidated" : "warning", invalidated ? active.remaining : `工具失败 · ${event.toolName}；不代表任务已完成，需要后续报告说明影响。`);
     }));
     pi.on("ui_prompt_start", () => guarded(() => {
         if (!active || !acknowledged || broken) return;
         promptDepth += 1; active.state = "waiting";
-        save(active, "等待 Pi 窗口中的人工确认；工作台不会自动回答。");
+        save(active, "waiting", "等待 Pi 窗口中的人工确认；工作台不会自动回答。");
     }));
     pi.on("ui_prompt_end", () => guarded(() => {
         if (!active || !acknowledged || broken) return;
         promptDepth = Math.max(0, promptDepth - 1);
-        if (!promptDepth) { active.state = "working"; save(active, "Pi 人工确认已返回；继续观察执行。"); }
+        if (!promptDepth) { active.state = "working"; save(active, "resumed", "Pi 人工确认已返回；继续观察执行。"); }
     }));
     pi.on("input", () => {
         guarded(() => {
             if (active && acknowledged && !broken) {
                 ownershipLost = true; active.delivery = "";
-                save(active, "Pi 收到额外输入；工作台停止归属推断，不会再停止可能无关的工作或接受本轮交付。");
+                save(active, "invalidated", "Pi 收到额外输入；工作台停止归属推断，不会再停止可能无关的工作或接受本轮交付。");
             }
         });
         return { action: "continue" };
@@ -340,6 +396,12 @@ export default function (pi: ExtensionAPI) {
     pi.on("agent_settled", (_event, ctx) => guarded(() => {
         context = ctx;
         if (!active || !acknowledged || broken) return;
+        if (compaction?.armed && !stopRequested && !ownershipLost) {
+            active.state = "working";
+            save(active); // Keep the handoff state durable without a compaction/tool transcript.
+            heartbeat();
+            return;
+        }
         if (stopRequested || ownershipLost || assistantError) {
             active.state = stopRequested ? "stopped" : ownershipLost ? "interrupted" : "failed";
             active.delivery = "";
@@ -349,11 +411,29 @@ export default function (pi: ExtensionAPI) {
         } else {
             active.state = "failed"; active.summary = "Pi 已空闲，但未提交最终 taskroom_report；不能认为任务完成。";
         }
-        save(active, "Pi agent_settled · 执行完全空闲，人工验收仍独立");
-        active = undefined; acknowledged = false; heartbeat();
+        save(active, active.state === "finished" ? "settled" : active.state,
+            (active.state === "finished" ? "" : active.summary + "\n") + "Pi agent_settled · 执行完全空闲，人工验收仍独立");
+        active = undefined; acknowledged = false; compaction = undefined; heartbeat();
     }));
     const protectNavigation = () => active ? { cancel: true } : undefined;
-    pi.on("session_before_tree", protectNavigation);
+    pi.on("session_before_tree", (event, ctx) => {
+        if (!active) return;
+        let allowed = false;
+        guarded(() => {
+            const entry = ctx.sessionManager.getEntry(event.preparation.targetId);
+            if (compaction?.armed && !compaction.target && !broken && !stopRequested && !ownershipLost && matches(ctx) &&
+                entry?.type === "branch_summary" && entry.summary.endsWith(`\n${compaction.summary}`) && hasCompactionReceipt(ctx, entry.fromId)) {
+                compaction.target = entry.id;
+                allowed = true;
+            }
+        });
+        return allowed ? undefined : { cancel: true };
+    });
+    pi.on("session_tree", (event, ctx) => guarded(() => {
+        if (!active || broken) return;
+        if (!compaction || event.newLeafId !== compaction.target || !matches(ctx)) throw new Error("Unverified navigation during a Taskroom run.");
+        compaction.navigated = true;
+    }));
     pi.on("session_before_switch", protectNavigation);
     pi.on("session_before_fork", protectNavigation);
     pi.on("session_shutdown", event => disconnect(event.reason));

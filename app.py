@@ -7,11 +7,17 @@ import argparse
 import asyncio
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
+import os
 from pathlib import Path
 import sys
 import time
 from typing import TypeVar
 from uuid import uuid4
+
+# Herdr may forward cell coordinates after Textual negotiates pixel mouse mode.
+# Set the default before importing Textual; keep explicit user settings intact.
+if os.environ.get("HERDR_ENV") == "1":
+    os.environ.setdefault("TEXTUAL_SMOOTH_SCROLL", "0")
 
 from rich.text import Text
 from textual import events, on
@@ -22,10 +28,11 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, OptionList, Select, Static, TextArea
 from textual.widgets.option_list import Option
 
-from delivery import activity_text, delivery_text
+from delivery import delivery_text, detail_text, overview_text
 from launch import Launch, connected_agent, create_pi
 from model import AGENTS, PROJECTS, RUNS, STATUSES, Board, Run, Task, sample_board
 from paths import DirectorySuggestions, directory_suggestions
+from records import TaskRecords
 from runtime import Agent, BridgeError, Runtime, canonical_directory
 from store import StorageError, Store, default_path
 
@@ -34,6 +41,28 @@ T = TypeVar("T")
 COLORS = {"draft": "#8794aa", "ready": "#aebcff", "running": "#79ccee", "blocked": "#f1b778", "review": "#d0b0f5", "done": "#90d4ad"}
 LANES = [("draft", "待安排"), ("ready", "待执行"), ("running", "执行 / 阻塞"), ("review", "待验收"), ("done", "已验收")]
 FILTERS = {"all": "全部状态", **STATUSES}
+
+
+class TaskList(OptionList):
+    """Single click selects; double click, Enter and Right activate a task."""
+    BINDINGS = [Binding("right", "select", "查看详情", show=False)]
+
+    def on_click(self, event: events.Click) -> None:
+        event.prevent_default()  # OptionList normally activates on every click.
+        event.stop()
+        index = event.style.meta.get("option")
+        if event.button != 1 or index is None or not 0 <= index < self.option_count:
+            return
+        if self.get_option_at_index(index).disabled:
+            return
+        self.highlighted = index
+        if event.chain == 2:
+            self.action_select()
+
+
+class TaskDetail(Vertical):
+    # Override the scroll area's Left binding only inside the detail panel.
+    BINDINGS = [Binding("left", "app.close_detail", "返回任务", show=False, priority=True)]
 
 
 class Dialog(ModalScreen):
@@ -441,17 +470,21 @@ class TaskRoom(App):
         self.status_filter = "all"
         self.view_mode = "list"
         self.detail_open = False
+        self.detail_expanded = False
+        self._detail_task_id: int | None = None
+        self.sidebar_open = False
         self.viewport_width = 80
         self.theme = "textual-dark"
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="masthead"):
+            yield Button("展开导航", id="sidebar-button")
             yield Static("◈  TASKROOM", id="brand")
             yield Static(("LOCAL · 本地保存 · Pi 显式接入" if self.runtime else "LOCAL · 本地保存 · 执行模拟") if self.store else "DEMO · 仅内存 · 退出即丢弃", id="demo-badge")
             yield Button("看板  v", id="view-button")
             yield Button("动作  Ctrl+K", id="palette-button")
         with Horizontal(id="workspace"):
-            with Vertical(id="sidebar"):
+            with VerticalScroll(id="sidebar", can_focus=False):
                 yield Static("工作队列", classes="nav-heading")
                 yield OptionList(id="nav-status", markup=False)
                 yield Static("项目 · 精确目录" if self.runtime else "项目 · 全部虚构", classes="nav-heading")
@@ -466,21 +499,21 @@ class TaskRoom(App):
                 with Horizontal(id="content"):
                     with Vertical(id="task-region"):
                         yield Static("", id="list-heading", markup=False)
-                        yield OptionList(id="task-list", markup=False)
+                        yield TaskList(id="task-list", markup=False)
                         yield Static("没有匹配的任务\n试试清空搜索 / 修改项目或状态筛选，或按 n 新建。", id="empty", markup=False)
                     with Horizontal(id="board"):
                         for key, label in LANES:
                             with Vertical(classes="lane", id=f"column-{key}"):
                                 yield Static(label, id=f"heading-{key}", classes="lane-heading")
-                                yield OptionList(id=f"lane-{key}", markup=False)
-                    with Vertical(id="inspector"):
+                                yield TaskList(id=f"lane-{key}", markup=False)
+                    with TaskDetail(id="inspector"):
                         yield Static("", id="detail-heading", markup=False)
                         yield VerticalScroll(Static("", id="detail-text", markup=False), id="detail-scroll", can_focus=True)
                         with Horizontal(id="detail-actions"):
                             yield Button("验收 r", id="accept-button", variant="success")
                             yield Button("补充/退回 b", id="return-button")
                             yield Button("记录", id="activity-button")
-                            yield Button("动作", id="detail-menu")
+                            yield Button("展开详情", id="detail-toggle")
         yield Static("", id="context-hint", markup=False)
         yield Footer()
 
@@ -565,7 +598,7 @@ class TaskRoom(App):
         nav.highlighted = next((i for i, (key, _) in enumerate(labels) if key == self.status_filter), None)
         context = self.project_name if self.project_name != "all" else "全部项目"
         self.query_one("#context-line", Static).update(f"{context}  /  {FILTERS[self.status_filter]}  /  {len(tasks)} 个任务")
-        self.query_one("#list-heading", Static).update("看板 · 窄屏按状态分组（Tab 切区）" if narrow_board else "任务队列                         Enter 查看详情")
+        self.query_one("#list-heading", Static).update("看板 · 窄屏按状态分组（Tab 切区） · → 详情" if narrow_board else "任务队列       单击选中 · 双击 / → / Enter 详情")
         self.query_one("#empty").display = not tasks
         self.query_one("#task-list").display = bool(tasks)
         self.show_detail()
@@ -576,45 +609,50 @@ class TaskRoom(App):
         task = self.selected_task
         detail = Text()
         if task:
+            if task.id != self._detail_task_id:
+                self.detail_expanded = False
+                self._detail_task_id = task.id
             heading = Text(f"D{task.id:03}  ·  {STATUSES[task.status]}", style=f"bold {COLORS[task.status]}")
             self.query_one("#detail-heading", Static).update(heading)
-            detail = delivery_text(task, self.board.runs.get(task.run_id))
-            detail.append("安排\n", style="bold #79ccee")
-            directory_label = "精确项目目录" if task.execution == "pi" else "样例目录（不会访问）"
-            detail.append(f"项目    {task.project}\n执行者  {self.agent_label(task.agent)}\n{directory_label}\n{self.board.projects[task.project] or '未选择'}\n\n")
-            detail.append("Pi 执行\n" if task.execution == "pi" else "模拟执行\n", style="bold #79ccee")
-            detail.append(RUNS[task.run] + "\n创建 ≠ 分配 ≠ 启动 ≠ 执行确认 ≠ 人工验收\n\n")
-            if task.execution == "pi":
-                current = self.board.runs.get(task.run_id)
-                if current:
-                    detail.append(f"Run {current.id}\nSession {current.session_id}\n状态 {current.state} · 修订 {current.seq}\n")
-                    if not current.terminal:
-                        agent = self.agents.get(current.agent_id)
-                        if not agent or not agent.fresh:
-                            detail.append("心跳未知/失联 ≠ 已停止；不会自动解除或重派。\n", style="#f1b778")
-                    if self.runtime_errors.get(current.id):
-                        detail.append(self.runtime_errors[current.id] + "\n", style="#f1b778")
-            detail.append("\n工具日志与历史轮次请点“记录”，或 Ctrl+K → 执行记录。\n", style="#a6b3c6")
+            current = self.board.runs.get(task.run_id)
+            if current and task.run != "none":
+                if not current.terminal:
+                    agent = self.agents.get(current.agent_id)
+                    if not agent or not agent.fresh:
+                        detail.append("心跳未知/失联 ≠ 已停止；不会自动解除或重派。\n", style="#f1b778")
+                if self.runtime_errors.get(current.id):
+                    detail.append(self.runtime_errors[current.id] + "\n", style="#f1b778")
+            detail.append_text(detail_text(task, current) if self.detail_expanded else overview_text(task, current))
+            if self.detail_expanded:
+                detail.append("\n安排\n", style="bold #79ccee")
+                directory = current.cwd if current and task.run != "none" else self.board.projects[task.project]
+                agent = self.agents.get(task.agent)
+                executor = agent.name if agent else "原 Pi 连接（身份见记录定位）" if task.execution == "pi" and task.agent else task.agent or "未分配"
+                detail.append(f"项目    {task.project}\n执行者  {executor}\n{'精确项目目录' if task.execution == 'pi' else '样例目录（不会访问）'}\n{directory or '未选择'}\n\n")
+                detail.append(RUNS[task.run] + "\n创建 ≠ 分配 ≠ 启动 ≠ 执行确认 ≠ 人工验收\n", style="#a6b3c6")
         else:
             self.query_one("#detail-heading", Static).update("没有选中的任务")
             detail.append("换个筛选条件，或按 n 记下一个新任务。")
         self.query_one("#detail-text", Static).update(detail)
+        toggle = self.query_one("#detail-toggle", Button)
+        toggle.label = "收起详情" if self.detail_expanded else "展开详情"
+        toggle.disabled = task is None
         self.query_one("#accept-button", Button).disabled = not bool(task and task.can_accept)
         self.query_one("#activity-button", Button).disabled = task is None
         self.query_one("#return-button", Button).disabled = not bool(task and task.status in ("review", "blocked") and not self.active_run(task))
-        hints = "Enter 详情 · p 项目 · f 状态 · Ctrl+K 全部动作"
+        hints = "→/Enter 详情 · p 项目 · f 状态 · Ctrl+K 全部动作"
         if task:
             if task.status == "review":
                 hints = "r 人工验收 · b 退回补充" if task.can_accept else "阶段交付不能整任务验收 · b 退回继续"
             elif self.active_run(task):
                 hints = "g 刷新进展 · x 请求停止 · Pi 中确认权限；失联处理见 Ctrl+K"
             elif task.status == "blocked":
-                hints = "需要你补充信息 · Enter 看原因 · b 补充后重新安排"
+                hints = "需要你补充信息 · →/Enter 看原因 · b 补充后重新安排"
             elif task.run in ("queued", "working"):
                 hints = "g 模拟确认 / 进展 / 阻塞 / 交付 · 不会真实执行"
             elif task.status in ("draft", "ready"):
                 hints = "e 编辑 · a 分配 · s 显式启动（分配不会启动）"
-        self.query_one("#context-hint", Static).update(hints + "  │  Esc 返回")
+        self.query_one("#context-hint", Static).update(hints + "  │  ←/Esc 返回")
 
     def on_resize(self, event: events.Resize) -> None:
         self.viewport_width = event.size.width
@@ -625,10 +663,18 @@ class TaskRoom(App):
             self.refresh_tasks()
             if was_tasks:
                 self.call_after_refresh(self.focus_tasks)
+            elif focused is not None:
+                if focused.id == "sidebar-button" and self.viewport_width >= 140:
+                    self.call_after_refresh(self.query_one("#nav-status", OptionList).focus)
+                elif self.query_one("#sidebar") in focused.ancestors and not self.query_one("#sidebar").display:
+                    self.call_after_refresh(self.query_one("#sidebar-button", Button).focus)
 
     def apply_layout(self) -> None:
         width = self.viewport_width
-        self.query_one("#sidebar").display = width >= 140
+        self.query_one("#sidebar").display = width >= 140 or self.sidebar_open
+        toggle = self.query_one("#sidebar-button", Button)
+        toggle.display = width < 140
+        toggle.label = "收起导航" if self.sidebar_open else "展开导航"
         board = self.view_mode == "board" and width >= 112
         self.query_one("#board").display = board and not self.detail_open
         self.query_one("#task-region").display = not board and not (self.detail_open and width < 100)
@@ -642,6 +688,9 @@ class TaskRoom(App):
 
     def on_descendant_focus(self, event: events.DescendantFocus) -> None:
         widget = event.widget
+        if isinstance(widget, TaskList) and widget.has_focus and self.detail_open:
+            self.detail_open = False
+            self.apply_layout()
         if isinstance(widget, OptionList) and widget.has_focus and widget.highlighted is not None and widget.id and widget.id.startswith("lane-"):
             task_id = widget.get_option_at_index(widget.highlighted).id
             if task_id:
@@ -674,6 +723,7 @@ class TaskRoom(App):
         elif key and (source == "task-list" or (source and source.startswith("lane-"))):
             self.selected_id = int(key.removeprefix("task-"))
             self.detail_open = True
+            self.detail_expanded = False
             self.show_detail()
             self.apply_layout()
             scroll = self.query_one("#detail-scroll", VerticalScroll)
@@ -683,8 +733,9 @@ class TaskRoom(App):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {"view-button": self.action_view, "palette-button": self.action_palette,
-                   "detail-menu": self.action_palette, "new-button": self.action_new_task,
-                   "filter-button": self.action_filter, "accept-button": self.action_review,
+                   "detail-toggle": self.action_toggle_detail, "new-button": self.action_new_task,
+                   "filter-button": self.action_filter, "sidebar-button": self.action_sidebar,
+                   "accept-button": self.action_review,
                    "return-button": self.action_return_work, "activity-button": self.action_activity}
         action = actions.get(event.button.id or "")
         if action:
@@ -702,7 +753,18 @@ class TaskRoom(App):
         else:
             self.query_one("#task-list", OptionList).focus()
 
+    def action_sidebar(self) -> None:
+        self.sidebar_open = not self.sidebar_open
+        self.apply_layout()
+        self.query_one("#nav-status" if self.sidebar_open else "#sidebar-button").focus()
+
     def action_back(self) -> None:
+        if self.sidebar_open and self.viewport_width < 140:
+            self.action_sidebar()
+            return
+        self.action_close_detail()
+
+    def action_close_detail(self) -> None:
         self.detail_open = False
         self.apply_layout()
         self.focus_tasks()
@@ -906,7 +968,7 @@ class TaskRoom(App):
     def record_runtime_warning(self, run: Run, message: str) -> None:
         self.runtime_errors[run.id] = message
         try:
-            self.apply_change(lambda board: board.tasks[run.task_id].events.append(message))
+            self.apply_change(lambda board: board.note(board.tasks[run.task_id], "warning", message, run_id=run.id, source="system"))
         except (ValueError, StorageError) as error:
             message += f"\n警告也未能保存：{error}；原意图仍保留，请勿重派。"
         self.notify(message, severity="error", timeout=12)
@@ -993,7 +1055,7 @@ class TaskRoom(App):
             run = self.board.runs[expected.id]
             if run.terminal or self.board.tasks[run.task_id].run_id != run.id:
                 raise BridgeError("这轮执行已结束或不再是当前轮次。")
-            self.apply_change(lambda board: board.tasks[run.task_id].events.append(f"人工请求停止 · {run.id} · 等待 Pi 确认"))
+            self.apply_change(lambda board: board.note(board.tasks[run.task_id], "stop_requested", "人工请求停止 · 等待 Pi 确认", run_id=run.id))
             await asyncio.to_thread(self.runtime.stop, run)
             self.notify("停止请求已发布 · 尚未确认结束")
         except (ValueError, OSError, StorageError) as error:
@@ -1065,10 +1127,21 @@ class TaskRoom(App):
                 self.mutate(lambda board: board.simulate(board.tasks[task.id], action))
         self.push_screen(Choice("推进模拟 · 不会执行任何真实工作", options), chosen)
 
+    def action_toggle_detail(self) -> None:
+        if not self.selected_task or len(self.screen_stack) > 1:
+            return
+        self.detail_expanded = not self.detail_expanded
+        self.detail_open = True
+        self.show_detail()
+        self.apply_layout()
+        scroll = self.query_one("#detail-scroll", VerticalScroll)
+        scroll.scroll_home(animate=False)
+        scroll.focus()
+
     def action_activity(self) -> None:
         task = self.selected_task
         if task:
-            self.push_screen(Confirm("执行记录 · 不代表交付成果", activity_text(self.board, task), "返回交付内容"))
+            self.push_screen(TaskRecords(self.board, task, show_location=lambda body: self.push_screen(Confirm("原 Pi 会话 · 只读定位", body, "返回记录"))))
 
     def action_review(self) -> None:
         task = self.selected_task
@@ -1100,7 +1173,8 @@ class TaskRoom(App):
             actions["pi_help"] = "接入已有 / 新开 Pi · 连接帮助"
         task = self.selected_task
         if task:
-            actions["activity"] = "执行记录 · 工具日志与历史轮次（只读）"
+            actions["activity"] = "任务记录 · 关键变化与历史轮次（只读）"
+            actions["toggle_detail"] = "收起详情" if self.detail_expanded else "展开详情 · 完整交付与任务要求"
             if task.execution == "simulation" or task.run == "none":
                 actions["edit_task"] = "编辑标题 / 说明 / 项目  e"
             if task.status in ("draft", "ready") and task.run == "none":
@@ -1121,7 +1195,7 @@ class TaskRoom(App):
     def action_help(self) -> None:
         storage_note = f"本地库：{self.store.path}\n提交成功的记录重启后保留；未提交表单不保存。" if self.store else "演示模式：只在内存里变化，退出即丢弃；重开恢复 12 个样例。"
         runtime_note = "s 核对并真实派发；g 刷新进展；x 请求停止。\nCtrl+K → 新建 Pi，或 a 选择 / 新建；创建与分配都不派发任务。\n退出工作台不会停止 Pi；重开只观察，不重派。\nPi 工具权限请在 Pi 窗口确认；交付证据自报，须人工核实。" if self.runtime else "s 模拟启动；g 模拟确认、进展、阻塞或交付。\n模拟任务没有真实执行，所有证据均为虚构。"
-        self.push_screen(Confirm("先记下，再安排；交付后，由你验收。", "n 新建草稿（继承当前项目；全部项目下放入收集箱）\n/ 搜索  ·  p 项目/添加目录  ·  f 状态\n↑↓ 选任务  ·  Enter 详情  ·  Esc 返回\nTab / Shift+Tab 切区；详情用 ↑↓ / PgUp / PgDn 滚动\nv 列表 / 看板；窄屏看板按状态分组\nCtrl+K 搜索当前可用动作\n\ne 编辑  ·  a 分配（不会启动）\nr 人工验收  ·  b 补充/退回（不自动重启）\n详情先展示实际交付；“记录”查看工具日志（不验收）。\n重新 Enter 打开详情回到正文顶部，普通更新保留滚动。\n\n输入框内字母只输入，不触发任务快捷键。\n表单标题 Enter 保存；多行编辑 Ctrl+Enter 提交。\n\n" + storage_note + "\n\n" + runtime_note + "\n\n不读写原 Code Board。", "知道了"))
+        self.push_screen(Confirm("先记下，再安排；交付后，由你验收。", "n 新建草稿（继承当前项目；全部项目下放入收集箱）\n/ 搜索  ·  p 项目/添加目录  ·  f 状态\n↑↓ 选任务  ·  →/Enter 详情  ·  ←/Esc 返回\nTab / Shift+Tab 切区；详情用 ↑↓ / PgUp / PgDn 滚动\n左右导航仅在任务区生效，输入框和弹窗保留原按键\nv 列表 / 看板；窄屏看板按状态分组\nCtrl+K 搜索当前可用动作\n\ne 编辑  ·  a 分配（不会启动）\nr 人工验收  ·  b 补充/退回（不自动重启）\n默认看简要动作与交付；“展开详情”核对完整正文和要求。\n“记录”只看关键变化与当时报告，可核对原 Pi 会话；不保存工具流水、不验收。\n重新 Enter 打开详情回到正文顶部，普通更新保留滚动。\n\n输入框内字母只输入，不触发任务快捷键。\n表单标题 Enter 保存；多行编辑 Ctrl+Enter 提交。\n\n" + storage_note + "\n\n" + runtime_note + "\n\n不读写原 Code Board。", "知道了"))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -74,6 +74,116 @@ class ModelTests(unittest.TestCase):
 
 
 class KeyboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_horizontal_arrows_open_detail_and_restore_task_position(self):
+        for width, board_view in ((80, False), (139, False), (180, False), (180, True), (80, True)):
+            with self.subTest(width=width, board=board_view):
+                board = Board()
+                for index in range(20):
+                    board.create(f"任务 {index + 1}", "终端工作台", "较长的任务说明\n" * 50)
+                app = TaskRoom(board)
+                async with app.run_test(size=(width, 24)) as pilot:
+                    if board_view:
+                        await pilot.press("v")
+                    selector = "#lane-draft" if board_view and width >= 112 else "#task-list"
+                    cards = app.query_one(selector, OptionList)
+                    await pilot.press(*["down"] * 8)
+                    await pilot.pause()
+                    self.assertEqual(app.selected_id, 9)
+                    position = cards.scroll_y
+                    self.assertGreater(position, 0)
+                    await pilot.press("right")
+                    detail = app.query_one("#detail-scroll", VerticalScroll)
+                    self.assertTrue(detail.has_focus)
+                    self.assertTrue(app.query_one("#inspector").display)
+                    self.assertEqual(app.selected_id, 9)
+                    await pilot.click("#detail-toggle")
+                    self.assertTrue(app.detail_expanded)
+                    await pilot.press("down", "down", "down")
+                    await pilot.pause()
+                    self.assertGreater(detail.scroll_y, 0)
+                    scrolled = detail.scroll_y
+                    await pilot.press("up")
+                    await pilot.pause()
+                    self.assertLess(detail.scroll_y, scrolled)
+                    self.assertEqual(app.selected_id, 9)
+                    await pilot.press("left")
+                    self.assertTrue(cards.has_focus)
+                    self.assertEqual(cards.highlighted, 8)
+                    self.assertEqual(cards.scroll_y, position)
+                    await pilot.press("down")
+                    self.assertEqual(app.selected_id, 10)
+                    await pilot.press("enter", "escape")
+                    self.assertTrue(cards.has_focus)
+                    self.assertEqual(app.selected_id, 10)
+                    self.assertTrue(all(task.run == "none" for task in board.tasks.values()))
+
+    async def test_horizontal_arrows_do_not_leave_text_inputs_or_modals(self):
+        app = TaskRoom()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("right", "slash", *"D001", "left")
+            search = app.query_one("#search", Input)
+            self.assertTrue(search.has_focus)
+            self.assertEqual(search.cursor_position, 3)
+            await pilot.press("right")
+            self.assertEqual(search.cursor_position, 4)
+            self.assertTrue(app.detail_open)
+            await pilot.press("escape", "right", "n", *"ab", "left")
+            form = app.screen
+            self.assertIsInstance(form, TaskForm)
+            title = form.query_one("#task-title", Input)
+            self.assertEqual(title.cursor_position, 1)
+            await pilot.press("right")
+            self.assertEqual(title.cursor_position, 2)
+            area = form.query_one(TextArea)
+            area.focus()
+            await pilot.press(*"ab", "left")
+            self.assertEqual(area.cursor_location, (0, 1))
+            await pilot.press("right")
+            self.assertEqual(area.cursor_location, (0, 2))
+            self.assertIs(app.screen, form)
+            self.assertTrue(app.detail_open)
+            await pilot.press("escape", "f", "down")
+            picker = app.screen
+            self.assertIsInstance(picker, Choice)
+            choices = picker.query_one("#choices", OptionList)
+            highlighted = choices.highlighted
+            await pilot.press("left", "right")
+            self.assertIs(app.screen, picker)
+            self.assertTrue(choices.has_focus)
+            self.assertEqual(choices.highlighted, highlighted)
+            self.assertEqual(app.status_filter, "all")
+            self.assertTrue(app.detail_open)
+            await pilot.press("escape", "r")
+            confirmation = app.screen
+            self.assertIsInstance(confirmation, Confirm)
+            await pilot.press("left", "right")
+            self.assertIs(app.screen, confirmation)
+            self.assertTrue(confirmation.query_one("#cancel").has_focus)
+            self.assertTrue(app.detail_open)
+            self.assertEqual(app.board.tasks[1].status, "review")
+            await pilot.press("escape", "left")
+            self.assertTrue(app.query_one("#task-list").has_focus)
+            self.assertEqual(len(app.board.tasks), 12)
+
+    async def test_left_returns_from_detail_actions_without_closing_sidebar(self):
+        app = TaskRoom()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.click("#sidebar-button")
+            nav = app.query_one("#nav-status", OptionList)
+            await pilot.press("down", "right", "left")
+            self.assertTrue(nav.has_focus)
+            self.assertEqual(app.status_filter, "all")
+            self.assertTrue(app.sidebar_open)
+            cards = app.query_one("#task-list", OptionList)
+            cards.focus()
+            await pilot.press("right", "tab")
+            self.assertTrue(app.query_one("#accept-button").has_focus)
+            await pilot.press("left")
+            self.assertTrue(cards.has_focus)
+            self.assertEqual(app.selected_id, 1)
+            self.assertFalse(app.detail_open)
+            self.assertTrue(app.sidebar_open)
+
     async def test_modal_buttons_visible_and_keyboard_scroll_can_submit_at_80x24(self):
         app = TaskRoom()
         async with app.run_test(size=(80, 24)) as pilot:
@@ -101,6 +211,10 @@ class KeyboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("模拟 · 本轮结束，验收独立确认", rendered)
             self.assertIn("阶段交付，仍有剩余工作", app.card(app.board.tasks[12]).plain)
             self.assertIn("人工已验收", app.card(app.board.tasks[9]).plain)
+            self.assertIn("已有报告，展开查看", rendered)
+            await pilot.click("#detail-toggle")
+            await pilot.pause()
+            rendered = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
             self.assertIn("样例方案和回归说明已整理", rendered)
             await pilot.press("slash", *"D003", "escape", "enter")
             await pilot.pause()
@@ -124,7 +238,7 @@ class KeyboardTests(unittest.IsolatedAsyncioTestCase):
         for board in (Board(), sample_board()):
             app = TaskRoom(board)
             async with app.run_test(size=(80, 24)) as pilot:
-                await pilot.press("slash", *"不存在的任务", "escape", "n")
+                await pilot.press("slash", *"不存在的任务", "escape", "left", "right", "n")
                 self.assertIsInstance(app.screen, TaskForm)
 
     async def test_full_keyboard_journey_with_partial_return_and_accept(self):
@@ -198,7 +312,9 @@ class KeyboardTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.press("down")
             self.assertEqual(app.selected_id, 2)
-            await pilot.press("enter", "pagedown")
+            await pilot.press("enter")
+            await pilot.click("#detail-toggle")
+            await pilot.press("pagedown")
             await pilot.pause()
             self.assertGreater(app.query_one("#detail-scroll", VerticalScroll).scroll_y, 0)
             for width, height in [(120, 30), (180, 40), (80, 24)]:
@@ -270,6 +386,110 @@ class KeyboardTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("[bold]", app.card(task).plain)
             await pilot.press("n", *"不要保存", "escape")
             self.assertEqual(len(app.board.tasks), 13)
+
+
+class MouseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clicking_back_from_detail_keeps_task_focus_after_resize(self):
+        app = TaskRoom()
+        async with app.run_test(size=(139, 50)) as pilot:
+            await pilot.press("down", "enter")
+            self.assertTrue(app.query_one("#detail-scroll").has_focus)
+            await pilot.click("#task-list", offset=(4, 1))
+            self.assertEqual(app.selected_id, 1)
+            self.assertTrue(app.query_one("#task-list").has_focus)
+            await pilot.resize_terminal(140, 50)
+            self.assertTrue(app.query_one("#task-list").has_focus)
+            self.assertFalse(app.detail_open)
+            await pilot.press("down")
+            self.assertEqual(app.selected_id, 2)
+
+    async def test_status_button_uses_all_three_toolbar_rows(self):
+        app = TaskRoom()
+        async with app.run_test(size=(139, 50)) as pilot:
+            for row in (0, 1, 2):
+                with self.subTest(row=row):
+                    await pilot.click("#search")
+                    self.assertTrue(await pilot.click("#filter-button", offset=(3, row)))
+                    self.assertIsInstance(app.screen, Choice)
+                    await pilot.click("#choices", offset=(3, 2))
+                    self.assertEqual(app.status_filter, "ready")
+                    self.assertEqual(len(app.screen_stack), 1)
+
+    async def test_narrow_sidebar_can_open_filter_and_close_without_losing_resize_focus(self):
+        app = TaskRoom()
+        async with app.run_test(size=(80, 24)) as pilot:
+            sidebar = app.query_one("#sidebar")
+            toggle = app.query_one("#sidebar-button", Button)
+            self.assertFalse(sidebar.display)
+            self.assertTrue(toggle.display)
+            await pilot.click("#sidebar-button")
+            self.assertTrue(sidebar.display)
+            self.assertTrue(app.query_one("#nav-status").has_focus)
+            await pilot.click("#nav-status", offset=(2, 1))
+            self.assertEqual(app.status_filter, "review")
+            await pilot.click("#nav-project", offset=(2, 3))
+            self.assertEqual(app.project_name, "终端工作台")
+            selected = app.selected_id
+            await pilot.click("#sidebar-button")
+            self.assertFalse(sidebar.display)
+            self.assertTrue(toggle.has_focus)
+            # Textual ignores a second click during the button's pressed effect.
+            await pilot.pause(toggle.active_effect_duration)
+            await pilot.click("#sidebar-button")
+            self.assertTrue(sidebar.display)
+            await pilot.press("escape")
+            self.assertFalse(sidebar.display)
+            self.assertTrue(toggle.has_focus)
+            self.assertEqual(app.selected_id, selected)
+            await pilot.resize_terminal(140, 24)
+            self.assertTrue(sidebar.display)
+            self.assertFalse(toggle.display)
+            self.assertTrue(app.query_one("#nav-status").has_focus)
+            await pilot.resize_terminal(139, 24)
+            self.assertFalse(sidebar.display)
+            self.assertTrue(toggle.display)
+            self.assertTrue(toggle.has_focus)
+            self.assertEqual(app.status_filter, "review")
+            self.assertEqual(app.project_name, "终端工作台")
+
+    async def test_single_click_selects_and_keeps_task_focus(self):
+        for width, board_view in ((80, False), (139, False), (180, False), (180, True), (80, True)):
+            with self.subTest(width=width, board=board_view):
+                board = Board()
+                board.create("第一项", "终端工作台")
+                board.create("第二项", "终端工作台")
+                app = TaskRoom(board)
+                async with app.run_test(size=(width, 24)) as pilot:
+                    if board_view:
+                        await pilot.press("v")
+                    selector = "#lane-draft" if board_view and width >= 112 else "#task-list"
+                    cards = app.query_one(selector)
+                    await pilot.press("down")
+                    self.assertEqual(app.selected_id, 2)
+                    await pilot.click("#search")
+                    await pilot.click(selector, offset=(4, 1))
+                    self.assertEqual(app.selected_id, 1)
+                    self.assertTrue(cards.has_focus)
+                    self.assertFalse(app.detail_open)
+                    await pilot.press("down")
+                    self.assertEqual(app.selected_id, 2)
+                    await pilot.click(selector, offset=(4, 1), button=3)
+                    await pilot.click(selector, offset=(4, 10))  # Blank space below both cards.
+                    self.assertEqual(app.selected_id, 2)
+                    self.assertFalse(app.detail_open)
+                    await pilot.resize_terminal(width + 1, 24)
+                    self.assertEqual(app.selected_id, 2)
+                    self.assertTrue(cards.has_focus)
+                    await pilot.press("enter")
+                    self.assertTrue(app.detail_open)
+                    self.assertTrue(app.query_one("#detail-scroll").has_focus)
+                    await pilot.press("escape")
+                    self.assertTrue(cards.has_focus)
+                    await pilot.double_click(selector, offset=(4, 1))
+                    self.assertEqual(app.selected_id, 1)
+                    self.assertTrue(app.detail_open)
+                    self.assertTrue(app.query_one("#detail-scroll").has_focus)
+                    self.assertTrue(all(task.run == "none" for task in board.tasks.values()))
 
 
 if __name__ == "__main__":

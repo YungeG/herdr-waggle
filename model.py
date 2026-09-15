@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field, fields
 from uuid import UUID
 
+from journal import append_event, check_history, encoded_event, validate_events
+
 PROJECTS = {
     "收集箱": "未选择目录 · 启动前请安排项目",
     "数据实验室": "/demo/data-lab/research/中文样本/feature-pipeline",
@@ -70,6 +72,7 @@ class Run:
             raise ValueError("执行状态不兼容。")
         if run.delivery == "full" and (not run.summary.strip() or not run.checks or run.remaining.strip()):
             raise ValueError("完整交付必须有摘要、证据且无剩余工作。")
+        validate_events(run.events, run_id=run.id, seq=run.seq)
         return run
 
 
@@ -117,9 +120,23 @@ class Board:
         if project not in self.projects:
             raise ValueError("请选择已登记的项目。")
         task = Task(max(self.tasks, default=0) + 1, title.strip(), project, description.strip(),
+                    events=[encoded_event("created", "任务创建 · 未发起执行", source="human") if self.live else "任务创建 · 未发起执行"],
                     execution="pi" if self.live else "simulation")
         self.tasks[task.id] = task
         return task
+
+    def note(self, task: Task, kind: str, text: str, *, run_id: str = "", source: str = "human") -> None:
+        """Human/client records stay task-owned; bind only an explicitly chosen round."""
+        if task.execution == "simulation":
+            task.events.append(text)  # Fictional demo history remains timeless and deterministic.
+            return
+        run = self.runs.get(run_id)
+        if run_id and (not run or run.task_id != task.id):
+            raise ValueError("关键记录不能关联其他任务或不存在的执行。")
+        if len(text) > 6000:
+            text = text[:5960] + "…（记录文字超出上限）"
+        value = encoded_event(kind, text, source=source, run_id=run_id, seq=run.seq if run else 0)
+        task.events = append_event(task.events, value)
 
     def edit(self, task: Task, title: str, project: str, description: str) -> None:
         if task.execution == "pi" and task.run != "none":
@@ -131,14 +148,14 @@ class Board:
         if project != task.project and task.execution == "pi":
             task.agent, task.status = "", "draft"
         task.title, task.project, task.description = title.strip(), project, description.strip()
-        task.events.append("人工编辑 · 未自动启动")
+        self.note(task, "edited", "人工编辑 · 未自动启动")
 
     def assign(self, task: Task, agent: str) -> None:
         valid_agent = agent in AGENTS if task.execution == "simulation" else valid_uuid(agent)
         if not valid_agent or task.status not in ("draft", "ready") or task.run != "none":
             raise ValueError("仅未启动的待安排/待执行任务可分配。")
         task.agent, task.status = agent, "ready"
-        task.events.append(f"人工分配给 {agent} · 尚未启动")
+        self.note(task, "assigned", f"人工分配给 {agent} · 尚未启动")
 
     def queue(self, task: Task) -> None:
         if task.execution != "simulation":
@@ -180,14 +197,14 @@ class Board:
         if not task.can_accept:
             raise ValueError("仅完整交付、无剩余工作的任务可人工验收。")
         task.status = "done"
-        task.events.append("人工验收 · 已确认整任务成果" if task.execution == "pi" else "人工验收样例 · 这是本地交互演示，不代表真实成果通过")
+        self.note(task, "accepted", "人工验收 · 已确认整任务成果" if task.execution == "pi" else "人工验收样例 · 这是本地交互演示，不代表真实成果通过", run_id=task.run_id)
 
     def return_work(self, task: Task, reason: str) -> None:
         if task.execution == "pi" and task.run_id and not self.runs[task.run_id].terminal:
             raise ValueError("执行尚未确认结束；请先停止，不能并发重派。")
         if task.status not in ("review", "blocked") or not reason.strip():
             raise ValueError("请给待验收或阻塞任务填写补充/退回原因。")
-        task.events.append(f"人工补充/退回 · {reason.strip()}")
+        self.note(task, "returned", f"人工补充/退回 · {reason.strip()}", run_id=task.run_id)
         task.status, task.run = "ready", "none"
         task.blocker, task.remaining = "", reason.strip()
         task.full_delivery = False
@@ -209,7 +226,7 @@ class Board:
         self.runs[run.id] = run
         task.run_id, task.run = run.id, "queued"
         task.full_delivery, task.summary, task.checks = False, "", []
-        task.events.append(f"派发意图已保存 · {run.id} · 等待 Pi 确认（未自动重试）")
+        self.note(task, "dispatched", "派发意图已保存 · 等待 Pi 确认（未自动重试）", run_id=run.id)
         return run
 
     def ingest(self, incoming: Run) -> bool:
@@ -218,6 +235,8 @@ class Board:
             raise ValueError("执行结果身份与派发快照不匹配。")
         if previous.terminal or incoming.seq <= previous.seq:
             return False
+        events = validate_events(incoming.events, run_id=incoming.id, seq=incoming.seq)
+        check_history(previous.events, incoming.events)
         self.runs[incoming.id] = incoming
         task = self.tasks[incoming.task_id]
         if task.run_id != incoming.id or task.status == "done":
@@ -233,22 +252,23 @@ class Board:
             task.run, task.status = "finished", "review"
             task.full_delivery = incoming.delivery == "full"
             task.remaining, task.blocker = incoming.remaining, ""
-            task.events.append(f"Pi 已交付且完全空闲 · {incoming.delivery} · 等待人工验收")
+            if not any(event.kind == "settled" for event in events):
+                self.note(task, "result_received", f"工作台收到本轮交付且空闲的结果 · {incoming.delivery} · 等待人工验收", run_id=incoming.id, source="system")
         else:
             task.run, task.status = "finished", "blocked"
             task.blocker = incoming.summary or f"执行 {incoming.state}；没有可验收的完整交付。"
-            task.events.append(f"本轮结束 · {incoming.state} · {task.blocker}")
+            if not any(event.kind in {"settled", "failed", "stopped", "interrupted"} for event in events):
+                self.note(task, "result_received", f"工作台收到本轮结束结果 · {incoming.state} · {task.blocker}", run_id=incoming.id, source="system")
         return True
 
     def abandon(self, task: Task, reason: str) -> None:
         run = self.runs.get(task.run_id)
         if not run or run.terminal or not reason.strip():
             raise ValueError("仅未确认结束的执行可人工解除，且必须填写已核实情况。")
+        self.note(task, "abandoned", f"人工确认旧 Pi 已停止 · {reason.strip()}", run_id=run.id)
         run.state = "abandoned"
-        run.events.append(f"人工确认旧 Pi 已停止 · {reason.strip()}")
         task.run, task.status, task.full_delivery = "finished", "blocked", False
         task.blocker = "人工解除失联执行；可补充要求后另起一轮。"
-        task.events.append(run.events[-1])
 
 
 def sample_board() -> Board:
