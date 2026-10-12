@@ -226,7 +226,7 @@ class DecisionReview(ModalScreen[bool]):
                 lines.append("   排除：" + ("；".join(spec.exclusions) or "仍受原任务范围限制"))
         return "\n".join(lines)
 
-    def confirm_label(self, narrow: bool = False) -> str:
+    def confirm_label(self) -> str:
         target = self.preview.target.kind
         if target in {"new_run", "live_supplement"} and request_only_decisions(self.preview.specs, self.preview.answers):
             if self.target_label.startswith("反馈／"):
@@ -276,7 +276,7 @@ class DecisionReview(ModalScreen[bool]):
         narrow = self.size.width < 64
         self.set_class(narrow, "decision-review-narrow")
         if self.is_mounted:
-            self.query_one("#decision-confirm", Button).label = self.confirm_label(narrow)
+            self.query_one("#decision-confirm", Button).label = self.confirm_label()
             if len(self.preview.specs) > 1:
                 self.query_one("#decision-review-progress", Static).update(
                     f"共 {len(self.preview.specs)} 项 · ↓看其余；默认返回" if narrow else

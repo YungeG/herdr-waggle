@@ -177,6 +177,6 @@ def validate_recovery(board: 'Board', task: 'Task', text: str) -> None:
 def recovery_contract_valid(text: str) -> bool:
     try:
         parts = split_recovery(text)
-        return parts is not None and not parts[2] and parse_compiled_contract(parts[0]) is not None
+        return parts is not None and not parts[2]
     except ValueError:
         return False
