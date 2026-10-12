@@ -1,8 +1,8 @@
 """Launch the CLI in disposable PTYs, never a Herdr pane or the user's database."""
 import os
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 
 from store import Store
 
@@ -43,11 +43,16 @@ class TerminalTests(unittest.TestCase):
                 nonlocal reported_support, reported_size
                 needle = text.encode()
                 deadline = time.monotonic() + 10
-                while needle not in output:
+                # A heading prefix can arrive before queued focus/paint work finishes.
+                # These are settled user-input batches, not a typeahead stress test.
+                while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         self.fail(f"PTY did not render {text!r}; tail={bytes(output[-400:])!r}")
-                    if selector.select(remaining):
+                    ready = selector.select(min(remaining, 0.05) if needle in output else remaining)
+                    if not ready and needle in output:
+                        return
+                    if ready:
                         try:
                             chunk = os.read(master, 65536)
                         except OSError as error:
@@ -56,6 +61,8 @@ class TerminalTests(unittest.TestCase):
                             else:
                                 raise
                         if not chunk:
+                            if needle in output:
+                                return
                             self.fail(f"PTY closed before {text!r}; tail={bytes(output[-400:])!r}")
                         output.extend(chunk)
                         self.assertLess(len(output), 2_000_000, "unexpected output flood")
@@ -90,11 +97,11 @@ class TerminalTests(unittest.TestCase):
                 os.close(slave)
 
     def test_herdr_defaults_to_cell_mouse_after_terminal_negotiation(self):
-        with TemporaryDirectory(prefix="taskroom-pty-herdr-mouse-") as directory:
+        with TemporaryDirectory(prefix="waggle-pty-herdr-mouse-") as directory:
             output = self.run_terminal(["demo"], [
                 ("DEMO", b"\x1b[<0;30;15M\x1b[<0;30;15m"),  # D002, not the navigation button.
                 ("g 模拟确认", b"\x1b[B\r"),
-                ("需要你确认样例口径", b"\x11"),
+                ("有阻塞，需你核实", b"\x11"),
             ], {"XDG_STATE_HOME": directory, "HERDR_ENV": "1", "TEXTUAL_SMOOTH_SCROLL": None,
                 "TERM_PROGRAM": None, "LC_TERMINAL": None}, negotiate_resize=True)
             self.assertIn(b"\x1b[?2048$p", output)
@@ -105,7 +112,7 @@ class TerminalTests(unittest.TestCase):
     def test_mouse_mode_preserves_external_terminal_defaults_and_explicit_settings(self):
         for herdr, smooth, pixels in ((None, None, True), ("0", None, True),
                                       ("1", "1", True), (None, "0", False), ("1", "0", False)):
-            with self.subTest(herdr=herdr, smooth=smooth), TemporaryDirectory(prefix="taskroom-pty-mode-") as directory:
+            with self.subTest(herdr=herdr, smooth=smooth), TemporaryDirectory(prefix="waggle-pty-mode-") as directory:
                 # Same D002 cell: use 3x9-pixel coordinates only when negotiated.
                 x, y = (88, 127) if pixels else (30, 15)
                 output = self.run_terminal(["demo"], [
@@ -120,37 +127,41 @@ class TerminalTests(unittest.TestCase):
                 self.assertNotIn("收起导航".encode(), output)
 
     def test_native_arrows_open_return_and_advance_tasks(self):
-        with TemporaryDirectory(prefix="taskroom-pty-arrows-") as directory:
+        with TemporaryDirectory(prefix="waggle-pty-arrows-") as directory:
             self.run_terminal(["demo"], [
                 ("DEMO", b"\x1b[B\x1b[B\x1b[C"),  # D003: Right opens detail.
-                ("需要你确认样例口径", b"\x1b[D\x1b[B\x1b[C"),  # Left, Down, Right: D004.
-                ("D004  ·  执行中", b"\t\t\r"),  # Disabled accept/rework are skipped; Tab via Records to Expand.
-                ("本轮交付正文", b"\x1b[6~"),  # Scroll only after expanded content is painted.
-                ("80×24 使用列表/详情切换", b"\x1b[D\x1b[B\x1b[C"),  # D005.
-                ("D005  ·  待安排", b"\t\t\r"),
+                ("有阻塞，需你核实", b"\x1b[D\x1b[B\x1b[C"),  # Left, Down, Right: D004.
+                ("D004 · 让窄终端也能舒适地查看任务", b""),
+                ("任务 · 执行中", b"\x0b"),  # Ctrl+K opens the task action menu.
+                ("任务动作", "展开详情".encode() + b"\r"),
+                ("任务说明 / 验收范围", b"\x1b[6~"),  # Expanded original scope, then PageDown to the footer.
+                ("要求与补充按原文展示", b"\x1b[D\x1b[B\x1b[C"),
+                ("D005 · 整理一份周末阅读清单", b""),
+                ("任务 · 待安排", b"\x0b"),
+                ("任务动作", "展开详情".encode() + b"\r"),
                 ("先记下来，不需要立刻交给 Agent", b"\x11"),
             ], {"XDG_STATE_HOME": directory, "HERDR_ENV": "1", "TEXTUAL_SMOOTH_SCROLL": None,
                 "TERM_PROGRAM": None, "LC_TERMINAL": None}, negotiate_resize=True)
 
-    def test_native_mouse_card_selection_keeps_arrow_navigation(self):
-        with TemporaryDirectory(prefix="taskroom-pty-mouse-") as directory:
+    def test_native_mouse_tap_opens_detail_then_back_keeps_arrow_navigation(self):
+        with TemporaryDirectory(prefix="waggle-pty-mouse-") as directory:
             self.run_terminal(["demo"], [
-                ("DEMO", b"\x1b[<0;6;15M\x1b[<0;6;15m"),  # Click D002 at 80x24.
-                ("g 模拟确认", b"\x1b[B\r"),  # Down selects D003; Enter opens its detail.
-                ("需要你确认样例口径", b"\x11"),
+                ("DEMO", b"\x1b[<0;6;15M\x1b[<0;6;15m"),  # Tap D002 at 80x24.
+                ("← 返回", b"\x1b[D\x1b[B\r"),  # Left returns; Down selects D003; Enter opens it.
+                ("有阻塞，需你核实", b"\x11"),
             ], {"XDG_STATE_HOME": directory})
 
     def test_native_mouse_opens_narrow_navigation_and_status_picker(self):
-        with TemporaryDirectory(prefix="taskroom-pty-nav-") as directory:
+        with TemporaryDirectory(prefix="waggle-pty-nav-") as directory:
             self.run_terminal(["demo"], [
-                ("DEMO", b"\x1b[<0;7;2M\x1b[<0;7;2m"),  # Navigation button.
-                ("工作队列", b"\x1b[<0;63;6M\x1b[<0;63;6m"),  # Middle toolbar row.
+                ("DEMO", b"\x1b[<0;7;1M\x1b[<0;7;1m"),  # Compact navigation button, row 1.
+                ("工作队列", b"\x1b[<0;63;3M\x1b[<0;63;3m"),  # Filter button in compact row 3.
                 ("筛选任务状态", b"\x11"),
             ], {"XDG_STATE_HOME": directory})
 
     def test_real_entry_create_draft_and_clean_exit(self):
-        with TemporaryDirectory(prefix="taskroom-pty-demo-") as directory:
-            path = Path(directory) / "taskroom/tasks.sqlite3"
+        with TemporaryDirectory(prefix="waggle-pty-demo-") as directory:
+            path = Path(directory) / "waggle/tasks.sqlite3"
             with Store(path) as store:
                 board = store.load()
                 board.create("已有记录不能混入演示", "收集箱")
@@ -165,8 +176,34 @@ class TerminalTests(unittest.TestCase):
             self.assertNotIn("已有记录不能混入演示".encode(), output)
             self.assertEqual(path.read_bytes(), before)
 
+    def test_detail_mouse_release_emits_osc52_in_disposable_herdr_mode_pty(self):
+        with TemporaryDirectory(prefix="waggle-pty-copy-") as directory:
+            path = Path(directory) / "tasks.sqlite3"
+            with Store(path) as store:
+                board = store.load()
+                board.create("COPY_ME 中文🙂", "收集箱")
+                store.save(board)
+            before = path.read_bytes()
+            # At 80x24 the detail title starts after "D001 · " at cell (12, 8).
+            copied = "\x1b]52;c;Q09QWV9NRQ==\a"
+            raw_copied = "\x1b]52;c;5Lit5paH8J+Zgg==\a"  # 中文🙂, through the read-only TextArea.
+            output = self.run_terminal(["run", "--db", str(path)], [
+                ("LOCAL", b"\x1b[C"),
+                ("任务 · 待安排", b"\x1b[<0;12;8M\x1b[<32;18;8M\x1b[<0;18;8m"),
+                (copied, b"\x0b"),
+                ("任务动作", "全屏\r".encode()),
+                ("打开时快照", b"\x1b[<0;10;23M\x1b[<0;10;23m"),
+                ("排版阅读", b"\x1b[<0;10;4M\x1b[<32;16;4M\x1b[<0;16;4m"),
+                (raw_copied, b"\x11"),
+            ], {"XDG_STATE_HOME": str(Path(directory) / "unused-default"), "HERDR_ENV": "1",
+                "TEXTUAL_SMOOTH_SCROLL": None, "TERM_PROGRAM": None, "LC_TERMINAL": None}, negotiate_resize=True)
+            self.assertEqual(output.count(copied.encode()), 1)
+            self.assertEqual(output.count(raw_copied.encode()), 1)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse((Path(directory) / "unused-default").exists())
+
     def test_persistent_entry_with_spaces_reopens_exact_task(self):
-        with TemporaryDirectory(prefix="taskroom-pty-local-") as directory:
+        with TemporaryDirectory(prefix="waggle-pty-local-") as directory:
             path = Path(directory) / "folder with spaces" / "任务.sqlite3"
             arguments = ["run", "--db", str(path)]
             environment = {"XDG_STATE_HOME": str(Path(directory) / "unused-default")}

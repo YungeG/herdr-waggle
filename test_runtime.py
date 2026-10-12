@@ -1,21 +1,34 @@
 """Pure run/migration contracts and fail-closed mailbox boundaries, no real user state."""
+import json
+import os
+import sqlite3
+import time
+import unittest
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import asdict
-import json
-import os
 from pathlib import Path
-import sqlite3
 from tempfile import TemporaryDirectory
-import time
-import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from decisions import review_requirements
 from journal import encoded_event
 from model import Board, Run, sample_board
-from runtime import Agent, BridgeError, Runtime, bridge_root, canonical_directory, install_bridge, private_dir, publish, read_json
-from store import APPLICATION_ID, StorageError, Store, decode, encode
+from runtime import (
+    Agent,
+    BridgeError,
+    Runtime,
+    bridge_root,
+    canonical_directory,
+    install_bridge,
+    private_dir,
+    publish,
+    read_json,
+)
+from store import APPLICATION_ID, StorageError, Store, decode, default_path, encode
+from task_context import WorkContract
+from test_capabilities import capability_record
 
 
 def prepared_board(cwd="/tmp/exact/project"):
@@ -23,6 +36,14 @@ def prepared_board(cwd="/tmp/exact/project"):
     board.add_project("真实目录", cwd)
     task = board.create("整任务", "真实目录", "中文，完整说明")
     board.assign(task, str(uuid4()))
+    contract = WorkContract(
+        purpose="implementation",
+        deliverable="完成整任务交付",
+        allowed_scope="项目目录",
+        verification="回归测试通过",
+        exclusions="不修改其他模块",
+    )
+    task.remaining = contract.compile()
     run = board.queue_real(task, str(uuid4()), str(uuid4()), cwd)
     return board, task, run
 
@@ -46,10 +67,11 @@ class RunTests(unittest.TestCase):
         settled.seq, settled.state = 3, "finished"
         board.ingest(settled)
         self.assertTrue(task.can_accept)
-        board.return_work(task, "还要补一项")
+        requirements = review_requirements("补齐一项模拟成果", "仅 Board 夹具状态", "下一轮身份不同，旧结果不得覆盖")
+        board.return_work(task, requirements)
         next_run = board.queue_real(task, str(uuid4()), original.session_id, original.cwd)
         self.assertNotEqual(next_run.id, original.id)
-        self.assertEqual(next_run.requirements, "还要补一项")
+        self.assertEqual(next_run.requirements, requirements)
         late = deepcopy(settled)
         late.seq = 99
         self.assertFalse(board.ingest(late))
@@ -169,10 +191,10 @@ class SessionLocationTests(unittest.TestCase):
 
 class MigrationTests(unittest.TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory(prefix="taskroom-migration-test-")
+        temporary = TemporaryDirectory(prefix="waggle-migration-test-")
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "v1.sqlite3"
-        self.original = json.dumps([{key: value for key, value in asdict(task).items() if key not in ("execution", "run_id")} for task in sample_board().tasks.values()], ensure_ascii=False)
+        self.original = json.dumps([{key: value for key, value in asdict(task).items() if key not in ("execution", "run_id", "retention", "steps")} for task in sample_board().tasks.values()], ensure_ascii=False)
 
     def legacy(self, data=None, trigger=False):
         with closing(sqlite3.connect(self.path)) as connection, connection:
@@ -214,7 +236,7 @@ class MigrationTests(unittest.TestCase):
 
 class MailboxTests(unittest.TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory(prefix="taskroom-mailbox-test-")
+        temporary = TemporaryDirectory(prefix="waggle-mailbox-test-")
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name)
         self.project = self.path / "非 Git 中文" / "sub directory"
@@ -231,6 +253,20 @@ class MailboxTests(unittest.TestCase):
                          "heartbeat": int(time.time() * 1000), "online": True, "idle": True, "active_run": ""}
         self.metadata_file = endpoint / "agent.json"
         publish(self.metadata_file, self.metadata)
+        publish(endpoint / "report-capabilities.json", capability_record(Agent.from_record(self.metadata)))
+
+    def test_waggle_default_namespace_and_explicit_mailbox_are_read_only(self):
+        state = self.path / "new-state"
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(state), "WAGGLE_BRIDGE_DIR": ""}):
+            self.assertEqual(default_path(), state / "waggle/tasks.sqlite3")
+            self.assertEqual(bridge_root(), state / "waggle/bridges")
+            self.assertEqual(Runtime().root, bridge_root())
+            self.assertFalse(state.exists(), "Choosing new defaults must not create or migrate data.")
+            explicit = self.path / "explicit-mailbox"
+            with patch.dict(os.environ, {"WAGGLE_BRIDGE_DIR": str(explicit)}):
+                self.assertEqual(Runtime().root, explicit)
+                self.assertEqual(default_path(), state / "waggle/tasks.sqlite3")
+                self.assertFalse(explicit.exists())
 
     def replace_metadata(self, **changes):
         self.metadata_file.unlink()
@@ -246,12 +282,14 @@ class MailboxTests(unittest.TestCase):
                 canonical_directory(value)
         self.assertFalse((self.project / ".pi").exists())
         target = install_bridge(str(self.project))
+        self.assertEqual(target, self.project / ".pi/extensions/waggle.ts")
+        self.assertIn("/waggle connect", target.read_text())
         self.assertEqual(install_bridge(str(self.project)), target)
         target.write_text("keep existing extension exactly")
         with self.assertRaises(BridgeError):
             install_bridge(str(self.project))
         self.assertEqual(target.read_text(), "keep existing extension exactly")
-        with patch.dict(os.environ, {"TASKROOM_BRIDGE_DIR": "relative"}):
+        with patch.dict(os.environ, {"WAGGLE_BRIDGE_DIR": "relative"}):
             with self.assertRaises(BridgeError):
                 bridge_root()
 

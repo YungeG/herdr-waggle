@@ -5,14 +5,14 @@ default:
     @just --list
 
 run *args:
-    uv run --no-project --python python3 app.py "$@"
+    ./run.sh "$@"
 
 demo:
-    uv run --no-project --python python3 app.py --demo
+    ./run.sh --demo
 
 # Normal interactive Pi, not an unattended agent; no settings or approval changes.
 pi directory *args:
-    uv run --no-project --python python3 runtime.py pi "$@"
+    ./pi.sh "$@"
 
 # Explicitly add a project-local loader for an already running Pi, then /reload.
 install-bridge directory:
@@ -20,3 +20,7 @@ install-bridge directory:
 
 test *args:
     uv run --no-project --python python3 --with textual==8.2.8 python -m unittest -v "$@"
+
+# Local archive only: current working tree, no commit/tag/push or Pi operations.
+package *args:
+    python3 release.py "$@"

@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionCommandContext, SessionManager } from "@ear
 import { Type } from "typebox";
 
 export default function (pi: ExtensionAPI) {
-    if (!process.env.TASKROOM_TEST_PROJECT) throw new Error("Compaction fixture requires a disposable project.");
+    if (!process.env.WAGGLE_TEST_PROJECT) throw new Error("Compaction fixture requires a disposable project.");
     let command: ExtensionCommandContext | undefined;
     let mode = "normal";
     let pending: { target: string; summary: string } | undefined;
@@ -12,7 +12,7 @@ export default function (pi: ExtensionAPI) {
     pi.registerCommand("fixture-compaction", {
         description: "Configure only the disposable compaction fixture",
         handler: async (args, ctx) => {
-            if (fs.realpathSync(ctx.cwd) !== process.env.TASKROOM_TEST_PROJECT) throw new Error("Non-test cwd.");
+            if (fs.realpathSync(ctx.cwd) !== process.env.WAGGLE_TEST_PROJECT) throw new Error("Non-test cwd.");
             if (args === "release") { release?.(); release = undefined; return; }
             if (args === "notice") {
                 pi.sendMessage({ customType: "pi-context", content: "context_compact complete. Unrequested old continuation.", display: false }, { triggerTurn: true });

@@ -1,21 +1,21 @@
 """Key history contracts through Board/Store and disposable runtime records."""
+import json
+import shutil
+import subprocess
+import unittest
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import UTC, datetime
-import json
 from pathlib import Path
-import shutil
-import subprocess
 from tempfile import TemporaryDirectory
-import unittest
 from uuid import uuid4
 
 from model import Board, Run
 from store import StorageError, Store
+from task_context import WorkContract
 from test_runtime import prepared_board
 
-
-PREFIX = "taskroom:event:1 "
+PREFIX = "waggle:event:1 "
 
 
 def event_record(run_id="", seq=0):
@@ -36,15 +36,15 @@ class HistoryStorage(unittest.TestCase):
         task = board.create("保留发生时间", "收集箱")
         after = datetime.now(UTC)
         original = task.events[-1]
-        self.assertTrue(original.startswith("taskroom:event:1 "), "New human actions must persist their event time, not a timeless sentence.")
-        record = json.loads(original.removeprefix("taskroom:event:1 "))
+        self.assertTrue(original.startswith("waggle:event:1 "), "New human actions must persist their event time, not a timeless sentence.")
+        record = json.loads(original.removeprefix("waggle:event:1 "))
         self.assertEqual((record["kind"], record["source"], record["run_id"], record["seq"]), ("created", "human", "", 0))
         self.assertTrue(record["at"].endswith("Z"))
         recorded = datetime.fromisoformat(record["at"])
         # The public event format stores milliseconds, not sub-millisecond clock precision.
         self.assertLessEqual(before.replace(microsecond=before.microsecond // 1000 * 1000), recorded)
         self.assertLessEqual(recorded, after)
-        with TemporaryDirectory(prefix="taskroom-history-test-") as temporary:
+        with TemporaryDirectory(prefix="waggle-history-test-") as temporary:
             path = Path(temporary) / "tasks.sqlite3"
             with Store(path) as store:
                 store.load()
@@ -54,7 +54,7 @@ class HistoryStorage(unittest.TestCase):
                     self.assertEqual(store.load().tasks[task.id].events, [original])
 
     def test_malformed_or_unknown_reserved_events_reject_save_without_overwriting(self):
-        with TemporaryDirectory(prefix="taskroom-history-test-") as temporary:
+        with TemporaryDirectory(prefix="waggle-history-test-") as temporary:
             path = Path(temporary) / "tasks.sqlite3"
             with Store(path) as store:
                 board = store.load()
@@ -62,7 +62,7 @@ class HistoryStorage(unittest.TestCase):
                 store.save(board)
                 original = path.read_bytes()
                 created = json.loads(task.events[0].removeprefix(PREFIX))
-                invalid = ["taskroom:event:2 {}", PREFIX + "not json", PREFIX + "{}"]
+                invalid = ["waggle:event:2 {}", PREFIX + "not json", PREFIX + "{}"]
                 for field, value in [("at", "2026-06-01T12:34:56"), ("at", "2026-02-30T00:00:00.000Z"),
                                      ("id", "not-a-uuid"), ("source", "model-clock"), ("seq", True),
                                      ("seq", -1), ("text", []), ("extra", "unknown")]:
@@ -86,6 +86,14 @@ class HistoryStorage(unittest.TestCase):
         board.add_project("内存项目", "/virtual/not-accessed")
         task = board.create("报告不是最后结果的别名", "内存项目")
         board.assign(task, str(uuid4()))
+        contract = WorkContract(
+            purpose="implementation",
+            deliverable="完成整任务交付",
+            allowed_scope="项目目录",
+            verification="回归测试通过",
+            exclusions="不修改其他模块",
+        )
+        task.remaining = contract.compile()
         queued = board.queue_real(task, str(uuid4()), str(uuid4()), "/virtual/not-accessed")
         result = deepcopy(queued)
         result.state, result.seq, result.delivery = "working", 2, "progress"
@@ -93,7 +101,7 @@ class HistoryStorage(unittest.TestCase):
         result.events = [wire_event(old)]
         result.summary, result.checks, result.remaining = "最新正文", ["最新依据"], "最新剩余项"
         self.assertTrue(board.ingest(result))
-        with TemporaryDirectory(prefix="taskroom-history-test-") as temporary:
+        with TemporaryDirectory(prefix="waggle-history-test-") as temporary:
             path = Path(temporary) / "tasks.sqlite3"
             with Store(path) as store:
                 store.load()
@@ -148,7 +156,7 @@ class HistoryStorage(unittest.TestCase):
         records = [json.loads(value.removeprefix(PREFIX)) for value in task.events]
         self.assertEqual(sum(record["kind"] == "history_gap" for record in records), 1)
         self.assertEqual(records[-1]["kind"], "edited")
-        with TemporaryDirectory(prefix="taskroom-history-test-") as temporary:
+        with TemporaryDirectory(prefix="waggle-history-test-") as temporary:
             with Store(Path(temporary) / "tasks.sqlite3") as store:
                 store.load()
                 store.save(board)
@@ -205,7 +213,7 @@ console.log(JSON.stringify({{run, protectedRecords}}));
                 self.assertLessEqual(len(json.dumps(asdict(result), ensure_ascii=False).encode()), 1024 * 1024)
                 self.assertEqual(any("history_gap" in value for value in result.events), count > 120)
                 self.assertTrue(board.ingest(result))
-                with TemporaryDirectory(prefix="taskroom-history-test-") as temporary:
+                with TemporaryDirectory(prefix="waggle-history-test-") as temporary:
                     with Store(Path(temporary) / "tasks.sqlite3") as store:
                         store.load()
                         store.save(board)

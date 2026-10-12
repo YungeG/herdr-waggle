@@ -1,13 +1,15 @@
 /** Key-event codec; keeps the existing string-list wire shape, never model clocks. */
 import { randomUUID } from "node:crypto";
+import { parseDecisions, parseStrictJSON, type DecisionSpec } from "./decisions.ts";
+import { parseHandoff, type Handoff } from "./handoff.ts";
 
-const PREFIX = "taskroom:event:1 ";
+const PREFIX = "waggle:event:1 ";
 const MAX_EVENTS = 120;
 const MAX_BYTES = 384 * 1024;
 const reportKinds = new Set(["progress", "blocked", "partial", "full"]);
 const uuid = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 export interface Brief { actions: string[]; outcome: string; verification: string }
-export interface Report { summary: string; checks: string[]; remaining: string; brief: Brief | null }
+export interface Report { summary: string; checks: string[]; remaining: string; brief: Brief | null; decisions?: DecisionSpec[]; handoff?: Handoff }
 interface KeyEvent {
     id: string; at: string; kind: string; source: "human" | "system" | "executor" | "simulation";
     run_id: string; seq: number; text: string; report: Report | null;
@@ -23,16 +25,23 @@ function strings(value: unknown, count: number, limit: number, nonempty = false)
     return Array.isArray(value) && value.length <= count && (!nonempty || value.length > 0) && value.every(item => text(item, limit, nonempty));
 }
 export function parseEvent(raw: string): KeyEvent | undefined {
-    if (!raw.startsWith("taskroom:event:")) return undefined;
+    if (!raw.startsWith("waggle:event:")) return undefined;
     if (!raw.startsWith(PREFIX) || Buffer.byteLength(raw) > MAX_BYTES) throw new Error("Unsupported or oversized key record.");
-    const row = object(JSON.parse(raw.slice(PREFIX.length)), ["id", "at", "kind", "source", "run_id", "seq", "text", "report"]);
+    const row = object(parseStrictJSON(raw.slice(PREFIX.length)), ["id", "at", "kind", "source", "run_id", "seq", "text", "report"]);
     if (!uuid(row.id) || (row.run_id !== "" && !uuid(row.run_id)) || !Number.isSafeInteger(row.seq) || (row.seq as number) < 0 ||
         !text(row.at, 24) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(row.at) || new Date(row.at).toISOString() !== row.at ||
         !text(row.kind, 48, true) || !text(row.source, 16) || !["human", "system", "executor", "simulation"].includes(row.source) || !text(row.text, 6000)) throw new Error("Invalid key record identity/time/content.");
     if (row.source === "executor" && !reportKinds.has(row.kind)) throw new Error("Executor source requires an explicit report snapshot.");
     if (["created", "edited", "assigned", "dispatched", "returned", "accepted", "abandoned"].includes(row.kind) && !["human", "simulation"].includes(row.source)) throw new Error("Invalid human-action source.");
     if (row.report !== null) {
-        const report = object(row.report, ["summary", "checks", "remaining", "brief"]);
+        const hasDecisions = Object.prototype.hasOwnProperty.call(row.report, "decisions");
+        const hasHandoff = Object.prototype.hasOwnProperty.call(row.report, "handoff");
+        const report = object(row.report, ["summary", "checks", "remaining", "brief", ...(hasDecisions ? ["decisions"] : []), ...(hasHandoff ? ["handoff"] : [])]);
+        if (hasHandoff) parseHandoff(report.handoff);
+        if (hasDecisions) {
+            parseDecisions(report.decisions);
+            if (row.kind === "full") throw new Error("Pending decisions cannot be a full delivery.");
+        }
         if (!text(report.summary, 6000, true) || !strings(report.checks, 32, 1000, false) || report.checks.some(check => !check.trim()) || !text(report.remaining, 6000)) throw new Error("Invalid report snapshot.");
         if (report.brief !== null) {
             const brief = object(report.brief, ["actions", "outcome", "verification"]);
@@ -43,6 +52,7 @@ export function parseEvent(raw: string): KeyEvent | undefined {
         if (["partial", "blocked"].includes(row.kind) && !(report.remaining as string).trim()) throw new Error("Partial/blocked snapshot needs remaining work.");
     }
     if (reportKinds.has(row.kind) !== (row.report !== null)) throw new Error("Report kind and snapshot disagree.");
+    // SAFETY: exact envelope, scalar fields, report schema and source invariants were validated above.
     return row as unknown as KeyEvent;
 }
 const bytes = (values: string[]) => Buffer.byteLength(JSON.stringify(values)) + Math.max(0, values.length - 1); // Python's persisted array includes separator spaces.
@@ -53,6 +63,8 @@ export function validateEvents(values: string[], runId: string, seq: number) {
     if (events.some(event => event.run_id !== runId || !["system", "executor"].includes(event.source) || event.seq < 1 || event.seq > seq)) throw new Error("Key event source/revision/run mismatch.");
     const origins = events.filter(event => event.kind === "origin");
     if (origins.length > 1 || origins.some(event => event.source !== "system")) throw new Error("Conflicting original session location.");
+    const parents = events.filter(event => event.kind === "continued");
+    if (parents.length > 1 || parents.some(event => event.source !== "system" || !uuid(event.text) || event.text === runId)) throw new Error("Invalid continuation parent.");
 }
 function encoded(kind: string, body: string, runId: string, seq: number, report: Report | null): string {
     const event: KeyEvent = { id: randomUUID(), at: new Date().toISOString(), kind, source: report ? "executor" : "system",
@@ -68,7 +80,7 @@ export function appendKeyEvent(values: string[], kind: string, body: string, run
     let gap = entries.find(entry => entry.event?.kind === "history_gap")?.raw;
     const kept = entries.filter(entry => entry.event?.kind !== "history_gap");
     const latestReport = [...kept].reverse().find(entry => entry.event?.report)?.raw;
-    const protectedItems = new Set([value, latestReport, ...kept.filter(entry => entry.event?.kind === "origin").map(entry => entry.raw)]);
+    const protectedItems = new Set([value, latestReport, ...kept.filter(entry => ["origin", "continued"].includes(entry.event?.kind || "")).map(entry => entry.raw)]);
     while (true) {
         const result = [...(gap ? [gap] : []), ...kept.map(entry => entry.raw)];
         if (result.length <= MAX_EVENTS && bytes(result) <= MAX_BYTES) return result;

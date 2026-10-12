@@ -1,25 +1,26 @@
 """Real Pi with offline effects and a controlled pi-context lifecycle, no live sessions."""
 import json
 import os
-from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 from uuid import uuid4
 
 from journal import parse_event
 from model import Board
 from runtime import BridgeError
 from store import Store
+from task_context import WorkContract
 from test_bridge import HERE, PiFixture
 
-PI_CONTEXT = Path(os.environ.get("TASKROOM_TEST_PI_CONTEXT", str(Path.home() / ".pi/agent/npm/node_modules/pi-context/src/index.ts")))
+PI_CONTEXT = Path(os.environ.get("WAGGLE_TEST_PI_CONTEXT", str(Path.home() / ".pi/agent/npm/node_modules/pi-context/src/index.ts")))
 
 
 @unittest.skipUnless(shutil.which("pi"), "installed Pi required")
 class CompactionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="taskroom-compact-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="waggle-compact-test-")
         self.addCleanup(self.temp.cleanup)
         self.fixture = PiFixture(Path(self.temp.name))
         self.addAsyncCleanup(self.fixture.close)
@@ -34,6 +35,14 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         board.add_project("临时项目", str(self.fixture.project))
         task = board.create(title, "临时项目")
         board.assign(task, agent.id)
+        contract = WorkContract(
+            purpose="implementation",
+            deliverable="完成整任务交付",
+            allowed_scope="项目目录",
+            verification="回归测试通过",
+            exclusions="不修改其他模块",
+        )
+        task.remaining = contract.compile()
         run = board.queue_real(task, str(uuid4()), agent.session_id, agent.cwd)
         return board, task, run
 
@@ -41,7 +50,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         board, task, run = await self.prepared("COMPACT_TWICE")
         self.fixture.runtime.dispatch(run)
         await self.fixture.event(lambda event: event.get("type") == "tool_execution_end"
-                and event.get("toolName") == "taskroom_report")
+                and event.get("toolName") == "waggle_report")
         result = await self.fixture.result(run)
         self.assertEqual((result.state, result.delivery), ("finished", "full"))
         self.assertEqual(result.identity, run.identity)
@@ -60,7 +69,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         _, _, run = await self.prepared(mode=mode)
         self.fixture.runtime.dispatch(run)
         await self.fixture.event(lambda event: event.get("type") == "tool_execution_end"
-                and event.get("toolName") == "taskroom_report")
+                and event.get("toolName") == "waggle_report")
         result = await self.fixture.result(run)
         self.assertEqual((result.state, result.delivery), ("finished", "full"))
         self.assertEqual(result.identity, run.identity)
@@ -130,6 +139,10 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gap_keeps_binding_refuses_unsafe_stop_and_unrelated_navigation(self):
         run, pending = await self.pause()
+        observation = self.fixture.runtime.read_activity(pending)
+        assert observation is not None
+        self.assertTrue(observation.bound)
+        self.assertTrue(observation.matches(pending))
         self.assertEqual(self.fixture.runtime.agent(run.agent_id).active_run, run.id)
         with self.assertRaises(BridgeError):
             self.fixture.runtime.dispatch(run)
@@ -142,6 +155,11 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         await self.release()
         result = await self.fixture.result(run)
         self.assertEqual((result.state, result.delivery), ("finished", "full"))
+        ended = self.fixture.runtime.read_activity(result)
+        assert ended is not None
+        self.assertGreater(ended.seq, observation.seq)
+        self.assertTrue(ended.matches(result))
+        self.assertFalse(ended.bound)
         self.assertEqual(json.loads((self.fixture.project / "fixture-result.json").read_text())["counter"], 1)
 
     async def test_missing_continuation_stays_unknown_not_failed_or_replayed(self):
@@ -157,7 +175,7 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_extra_input_during_gap_is_not_adopted_by_continuation(self):
         run, _ = await self.pause()
-        self.assertTrue((await self.fixture.request("prompt", message="Independent human input, not this task."))["success"])
+        self.assertTrue((await self.fixture.native_input("Independent human input, not this task.", "独立输入（解除任务关联）"))["success"])
         interrupted = await self.fixture.result(run)
         self.assertEqual((interrupted.state, interrupted.delivery), ("interrupted", ""))
         await self.release()
@@ -220,10 +238,10 @@ class CompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Deliberate offline provider failure", result.summary)
 
 
-@unittest.skipUnless(shutil.which("pi") and PI_CONTEXT.is_file(), "installed Pi and pi-context required; set TASKROOM_TEST_PI_CONTEXT")
+@unittest.skipUnless(shutil.which("pi") and PI_CONTEXT.is_file(), "installed Pi and pi-context required; set WAGGLE_TEST_PI_CONTEXT")
 class InstalledPiContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_installed_context_compact_preserves_run_and_single_effect(self):
-        with tempfile.TemporaryDirectory(prefix="taskroom-real-compact-") as directory:
+        with tempfile.TemporaryDirectory(prefix="waggle-real-compact-") as directory:
             fixture = PiFixture(Path(directory))
             try:
                 await fixture.start(extra_extensions=(PI_CONTEXT,))
@@ -234,10 +252,18 @@ class InstalledPiContextTests(unittest.IsolatedAsyncioTestCase):
                 board.add_project("临时项目", str(fixture.project))
                 task = board.create("COMPACT_TWICE", "临时项目")
                 board.assign(task, agent.id)
+                contract = WorkContract(
+                    purpose="implementation",
+                    deliverable="完成整任务交付",
+                    allowed_scope="项目目录",
+                    verification="回归测试通过",
+                    exclusions="不修改其他模块",
+                )
+                task.remaining = contract.compile()
                 run = board.queue_real(task, str(uuid4()), agent.session_id, agent.cwd)
                 fixture.runtime.dispatch(run)
                 await fixture.event(lambda event: event.get("type") == "tool_execution_end"
-                        and event.get("toolName") == "taskroom_report")
+                        and event.get("toolName") == "waggle_report")
                 result = await fixture.result(run)
                 self.assertEqual((result.state, result.delivery), ("finished", "full"))
                 self.assertEqual(result.identity, run.identity)

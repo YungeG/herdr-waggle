@@ -58,7 +58,7 @@ def main():
     named = {**clean, "HERDR_SESSION": session}
     outer = None
     session_requested = False
-    with tempfile.TemporaryDirectory(prefix="taskroom-native-", dir="/var/tmp") as temporary:
+    with tempfile.TemporaryDirectory(prefix="waggle-native-", dir="/var/tmp") as temporary:
         root = Path(temporary)
         # Enable nesting ONLY for this isolated test config, never the user's config.
         herdr_config = root / "herdr-test.toml"
@@ -72,7 +72,7 @@ def main():
         fixture = Path(__file__).with_name("fixture-provider.ts").resolve()
         (config / "extensions/fixture.ts").write_text(
             f"import fixture from {json.dumps(str(fixture))};\n"
-            f"process.env.TASKROOM_TEST_PROJECT = {json.dumps(str(project))};\nexport default fixture;\n")
+            f"process.env.WAGGLE_TEST_PROJECT = {json.dumps(str(project))};\nexport default fixture;\n")
         try:
             split = command(["pane", "split", "--current", "--direction", "down", "--cwd", str(root), "--no-focus"], parent)
             outer = split["result"]["pane"]["pane_id"]
@@ -95,7 +95,7 @@ def main():
                      "PI_SKIP_VERSION_CHECK": "1"}
             runtime = Runtime(root / "bridges")
             with patch.dict(os.environ, inner, clear=True):
-                launch = create_pi(runtime, str(project), "离线新建回归", "taskroom-test/fixture", str(uuid4()))
+                launch = create_pi(runtime, str(project), "离线新建回归", "waggle-test/fixture", str(uuid4()))
             assert launch.state == "starting", launch
             try:
                 agent = until(lambda: connected_agent(runtime, launch))

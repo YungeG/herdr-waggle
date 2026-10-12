@@ -1,17 +1,17 @@
 """Bounded path lookup and real Textual selection; all paths/databases disposable."""
-from contextlib import contextmanager
 import os
-from pathlib import Path
-from tempfile import TemporaryDirectory
 import threading
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from textual import events
 from textual.containers import VerticalScroll
 from textual.widgets import Button, Input, OptionList, Static
 
-from app import ProjectForm, TaskRoom
+from app import ProjectForm, Waggle
 from paths import DirectorySuggestions, directory_suggestions
 from runtime import Runtime
 from store import Store
@@ -20,7 +20,7 @@ from test_live import wait_ui
 
 class DirectoryTests(unittest.TestCase):
     def setUp(self):
-        self.temp = self.enterContext(TemporaryDirectory(prefix="taskroom-path-test-"))
+        self.temp = self.enterContext(TemporaryDirectory(prefix="waggle-path-test-"))
         self.root = Path(self.temp)
         for name in ("中文 alpha", "中文 beta", ".hidden"):
             (self.root / name).mkdir()
@@ -82,13 +82,13 @@ class DirectoryTests(unittest.TestCase):
 
 class DirectoryUI(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.temp = self.enterContext(TemporaryDirectory(prefix="taskroom-path-ui-"))
+        self.temp = self.enterContext(TemporaryDirectory(prefix="waggle-path-ui-"))
         self.root = Path(self.temp)
         self.project = self.root / "中文 project"
         self.project.mkdir()
         self.runtime = Runtime(self.root / "bridges")
         self.store = self.enterContext(Store(self.root / "tasks.sqlite3"))
-        self.app = TaskRoom(store=self.store, runtime=self.runtime)
+        self.app = Waggle(store=self.store, runtime=self.runtime)
 
     async def open_form(self, pilot):
         await pilot.press("p", *"添加", "enter", *"我的项目", "tab")
@@ -187,7 +187,7 @@ class DirectoryUI(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 self.assertEqual(self.app.board.projects, {"收集箱": ""})
         # A closed Textual App cannot be mounted again; reopen a fresh instance.
-        self.app = TaskRoom(store=self.store, runtime=self.runtime)
+        self.app = Waggle(store=self.store, runtime=self.runtime)
         # A slow read finishing after Escape must not update the closed screen.
         entered, release, finished = threading.Event(), threading.Event(), threading.Event()
         def slow(_):

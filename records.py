@@ -13,7 +13,7 @@ from textual.widgets import Button, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from journal import EVENT_LABELS, REPORT_KINDS, SOURCE_LABELS, Event, local_time, readable_event
-from model import Board, Run, Task
+from model import SUPPLEMENT_STATES, Board, Run, Task
 from runtime import locate_session
 
 STATES = {"queued": "等待确认", "working": "执行中", "waiting": "等待你", "finished": "执行已结束",
@@ -52,6 +52,7 @@ class TaskRecords(ModalScreen[None]):
         super().__init__()
         self.task_snapshot = deepcopy(task)
         self.runs = {run.id: deepcopy(run) for run in board.runs.values() if run.task_id == task.id}
+        self.supplements = {run_id: deepcopy(board.run_supplements(run_id)) for run_id in self.runs}
         self.show_location = show_location
         self.selected_run_id = ""
 
@@ -132,14 +133,16 @@ class TaskRecords(ModalScreen[None]):
         run_id, record = data
         self.selected_run_id = run_id
         body = event_body(record) if record else round_body(self.runs[run_id]) if run_id else "任务级记录未关联具体轮次；旧记录不补造时间或轮次。"
+        if run_id and record is None and self.supplements[run_id]:
+            body += "\n\n本轮补充说明 · 打开记录时的保存状态，不是当时报告的别名\n"
+            for note in self.supplements[run_id]:
+                body += f"\n{SUPPLEMENT_STATES[note.status]} · {note.id}\n{note.text}\n"
         self.query_one("#record-body", Static).update(body)
         self.query_one("#record-body-scroll", VerticalScroll).scroll_home(animate=False)
         self.query_one("#locate-session", Button).disabled = not bool(run_id)
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         self.show_node(event.node)
-        if event.node.children:
-            event.node.toggle()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()

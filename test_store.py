@@ -1,22 +1,30 @@
 """All storage tests use disposable databases, never the user's task records."""
+import json
+import os
+import sqlite3
+import unittest
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import asdict
-import json
-import os
 from pathlib import Path
-import sqlite3
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 
 from model import Board, sample_board
-from store import APPLICATION_ID, SCHEMA_VERSION, StorageError, Store, decode, default_path, encode
+from store import (
+    APPLICATION_ID,
+    SCHEMA_VERSION,
+    StorageError,
+    Store,
+    decode,
+    default_path,
+    encode,
+)
 
 
 class StoreTests(unittest.TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory(prefix="taskroom-store-test-")
+        temporary = TemporaryDirectory(prefix="waggle-store-test-")
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "state" / "tasks.sqlite3"
 
@@ -184,10 +192,10 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(StorageError):
             Store(self.path.parent)
         with patch.dict(os.environ, {"XDG_STATE_HOME": str(self.path.parent)}):
-            self.assertEqual(default_path(), self.path.parent / "taskroom" / "tasks.sqlite3")
+            self.assertEqual(default_path(), self.path.parent / "waggle" / "tasks.sqlite3")
         for state in ("", "relative/path"):
             with patch.dict(os.environ, {"XDG_STATE_HOME": state}), patch("store.Path.home", return_value=self.path.parent):
-                self.assertEqual(default_path(), self.path.parent / ".local/state/taskroom/tasks.sqlite3")
+                self.assertEqual(default_path(), self.path.parent / ".local/state/waggle/tasks.sqlite3")
 
 
 if __name__ == "__main__":

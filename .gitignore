@@ -22,3 +22,6 @@ launches/
 sessions/
 *.log
 .DS_Store
+
+# Local release archives and checksums
+/dist/

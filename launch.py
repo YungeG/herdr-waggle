@@ -76,7 +76,7 @@ def pi_command(runtime: Runtime, launch: Launch) -> list[str]:
     directory = launch.directory(runtime)
     command = ["pi", "-e", str(bridge_entry(launch.cwd)), "--session-dir", str(directory / "sessions"),
                "--session-id", launch.session_id, "--name", launch.name,
-               "--taskroom-launch", str(directory / "request.json")]
+               "--waggle-launch", str(directory / "request.json")]
     if launch.model:
         command.extend(["--model", launch.model])
     return command
@@ -119,7 +119,7 @@ def create_pi(runtime: Runtime, directory: str, name: str, model: str, launch_id
     workspace = _handle(caller, "workspace_id")
     launch = prepare_launch(runtime, directory, name, model, launch_id)
     try:
-        environment = {"TASKROOM_BRIDGE_DIR": str(runtime.root)}
+        environment = {"WAGGLE_BRIDGE_DIR": str(runtime.root)}
         # Only configuration paths/non-secret startup policy; never copy API keys into argv.
         for key in ("PI_CODING_AGENT_DIR", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "PI_OFFLINE", "PI_TELEMETRY", "PI_SKIP_VERSION_CHECK"):
             if key in os.environ:
@@ -134,9 +134,15 @@ def create_pi(runtime: Runtime, directory: str, name: str, model: str, launch_id
         launch.state = "tab_created"
         launch.message = "标签页已创建；尚未确认启动命令。"
         save_launch(runtime, launch)  # Preserve exact new IDs before sending any terminal input.
+        # Keep names like --clear/--help literal; Herdr trims pane labels server-side.
+        pane = _herdr("pane", "rename", launch.pane_id, f" {launch.name}").get("pane")
+        expected = {"pane_id": launch.pane_id, "tab_id": launch.tab_id,
+                    "workspace_id": workspace, "label": launch.name}
+        if not isinstance(pane, dict) or any(pane.get(key) != value for key, value in expected.items()):
+            raise BridgeError("新 pane 名称或归属未确认；未发送 Pi 启动命令。")
         _herdr("pane", "run", launch.pane_id, shlex.join(pi_command(runtime, launch)))
         launch.state = "starting"
-        launch.message = "启动命令已提交；等待新 Pi 连接。项目/工具权限请在新标签页处理，尚未派发任务。"
+        launch.message = "名称已同步；启动命令已提交，等待新 Pi 连接。项目/工具权限请在新标签页处理，尚未派发任务。"
         save_launch(runtime, launch)
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         launch.state = "unknown"

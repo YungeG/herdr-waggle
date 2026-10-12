@@ -3,14 +3,21 @@
 Decode only the reserved envelope. Legacy text is left untouched, not migrated or
 assigned a time on read. Timestamps never decide run state or acceptance.
 """
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 import json
 import re
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-PREFIX = "taskroom:event:1 "
-RESERVED = "taskroom:event:"
+from decisions import DecisionSpec, parse_specs
+from handoff import Handoff
+
+if TYPE_CHECKING:
+    from model import Run, Task
+
+PREFIX = "waggle:event:1 "
+RESERVED = "waggle:event:"
 REPORT_KINDS = {"progress", "blocked", "partial", "full"}
 MAX_EVENTS = 120
 MAX_EVENT_BYTES = 384 * 1024
@@ -29,6 +36,8 @@ class Report:
     checks: list[str]
     remaining: str
     brief: Brief | None = None
+    decisions: tuple[DecisionSpec, ...] | None = None
+    handoff: Handoff | None = None
 
 
 @dataclass(frozen=True)
@@ -82,12 +91,16 @@ def _brief(value: object) -> Brief | None:
 def _report(value: object) -> Report | None:
     if value is None:
         return None
-    row = _object(value, {"summary", "checks", "remaining", "brief"})
+    names = {"summary", "checks", "remaining", "brief"}
+    optional = {key for key in ("decisions", "handoff") if isinstance(value, dict) and key in value}
+    row = _object(value, names | optional)
     checks = _strings(row["checks"], 32, 1000)
     if any(not check.strip() for check in checks):
         raise ValueError("报告依据不能是空白文字。")
     return Report(_text(row["summary"], 6000, nonempty=True), checks,
-                  _text(row["remaining"], 6000), _brief(row["brief"]))
+                  _text(row["remaining"], 6000), _brief(row["brief"]),
+                  parse_specs(row["decisions"]) if "decisions" in row else None,
+                  Handoff.from_record(row["handoff"]) if "handoff" in row else None)
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict:
@@ -105,6 +118,8 @@ def parse_event(value: str) -> Event | None:
         return None
     if not value.startswith(PREFIX) or len(value.encode("utf-8")) > MAX_EVENT_BYTES:
         raise ValueError("关键记录版本未知或内容过大。")
+    # Strict codec failures deliberately propagate to Store/runtime boundaries; never admit malformed data.
+    # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
     row = _object(json.loads(value[len(PREFIX):], object_pairs_hook=_unique_object),
                   {"id", "at", "kind", "source", "run_id", "seq", "text", "report"})
     at = _text(row["at"], 24)
@@ -122,10 +137,12 @@ def parse_event(value: str) -> Event | None:
     report = _report(row["report"])
     if source == "executor" and kind not in REPORT_KINDS:
         raise ValueError("执行者来源只能对应明确的自报快照。")
-    if kind in {"created", "edited", "assigned", "dispatched", "returned", "accepted", "abandoned"} and source not in {"human", "simulation"}:
+    if kind in {"created", "edited", "assigned", "dispatched", "returned", "accepted", "abandoned", "archived", "trashed", "restored", "supplement_requested", "supplement_saved", "plan_defined", "step_added", "step_updated"} and source not in {"human", "simulation"}:
         raise ValueError("人工操作记录的来源不正确。")
     if (kind in REPORT_KINDS) != (report is not None) or (report and source not in {"executor", "simulation"}):
         raise ValueError("报告快照与记录类型/来源不一致。")
+    if kind == "full" and report and report.decisions:
+        raise ValueError("待决策事项不能同时标记为完整交付。")
     if kind == "full" and report and (not report.checks or report.remaining.strip()):
         raise ValueError("完整交付快照必须有依据且无剩余项。")
     if kind in {"blocked", "partial"} and report and not report.remaining.strip():
@@ -148,6 +165,10 @@ def validate_events(values: list[str], *, run_id: str | None = None, seq: int | 
     origins = [event for event in events if event.kind == "origin"]
     if len(origins) > 1 or any(event.source != "system" or not event.run_id for event in origins):
         raise ValueError("原 Pi 会话定位记录冲突。")
+    parents = [event for event in events if event.kind == "continued"]
+    if len(parents) > 1 or any(event.source != "system" or not event.run_id or
+                               _uuid(event.text) == event.run_id for event in parents):
+        raise ValueError("执行续接的父轮次标识无效或重复。")
     return events
 
 
@@ -156,7 +177,7 @@ def check_history(previous: list[str], incoming: list[str]) -> None:
     old = {event.id: event for value in previous if (event := parse_event(value))}
     new = {event.id: event for value in incoming if (event := parse_event(value))}
     for key, event in old.items():
-        if (key in new and new[key] != event) or (event.kind == "origin" and key not in new):
+        if (key in new and new[key] != event) or (event.kind in {"origin", "continued"} and key not in new):
             raise ValueError("原执行的关键记录或 Pi 会话定位被更改，拒绝应用。")
 
 
@@ -169,7 +190,7 @@ def append_event(values: list[str], value: str) -> list[str]:
     gap = next((raw for raw, event in items if event and event.kind == "history_gap"), None)
     kept = [(raw, event) for raw, event in items if not event or event.kind != "history_gap"]
     latest_report = next((raw for raw, event in reversed(kept) if event and event.report), None)
-    protected = {value, latest_report, *(raw for raw, event in kept if event and event.kind == "origin")}
+    protected = {value, latest_report, *(raw for raw, event in kept if event and event.kind in {"origin", "continued"})}
     while True:
         result = ([gap] if gap else []) + [raw for raw, _ in kept]
         if len(result) <= MAX_EVENTS and len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= MAX_EVENT_BYTES:
@@ -194,6 +215,12 @@ EVENT_LABELS = {
     "stopped": "确认停止", "settled": "执行空闲（非验收）", "failed": "执行失败", "interrupted": "执行中断",
     "invalidated": "此前交付失效", "warning": "需要核实", "returned": "补充 / 退回", "accepted": "人工验收",
     "abandoned": "人工确认旧执行停止", "result_received": "工作台收到结果", "history_gap": "部分记录未保留",
+    "archived": "归档任务", "trashed": "移入回收站", "restored": "恢复任务",
+    "supplement_saved": "保存补充要求", "supplement_requested": "补充发送意图",
+    "supplement_queued": "补充等待接收", "supplement_received": "Pi 接收补充",
+    "supplement_rejected": "补充未被接收", "supplement_covered": "补充已自报覆盖",
+    "continued": "Pi 直接续接新一轮", "direct_input": "Pi 本任务输入", "input_received": "Pi 接收直接输入",
+    "plan_defined": "人工定义步骤计划", "step_added": "人工追加步骤", "step_updated": "人工更新步骤进度",
 }
 SOURCE_LABELS = {"human": "人工操作", "system": "系统记录", "executor": "执行者自报", "simulation": "模拟 · 虚构"}
 
@@ -207,6 +234,7 @@ def readable_event(value: str) -> Event | None:
         return Event("", "", parts[1], "executor", "", 0, parts[2], None)
     prefixes = {
         "任务创建 ·": "created", "人工编辑 ·": "edited", "人工分配给 ": "assigned",
+        "人工归档任务 ·": "archived", "人工移入回收站 ·": "trashed", "人工恢复任务 ·": "restored",
         "派发意图已保存 ·": "dispatched", "人工补充/退回 ·": "returned", "人工验收": "accepted",
         "人工确认旧 Pi 已停止 ·": "abandoned", "人工请求停止 ·": "stop_requested",
         "Pi 已确认对应任务消息 ·": "acknowledged", "Pi agent_settled": "settled",
@@ -224,11 +252,44 @@ def readable_event(value: str) -> Event | None:
     return Event("", "", kind, source, "", 0, value, None)
 
 
+def last_progress_report(run: "Run") -> Event | None:
+    """Last real self-report, even after a fault; never an acceptance/decision source."""
+    return next((event for event in reversed(validate_events(run.events, run_id=run.id, seq=run.seq))
+                 if event.source == "executor" and event.id and event.report and event.kind in REPORT_KINDS), None)
+
+
+def current_report(task: "Task", run: "Run | None") -> Event | None:
+    """Canonical current report for rendering AND human decision preparation."""
+    if (not run or task.run == "none" or task.run_id != run.id or run.task_id != task.id
+            or run.state in {"failed", "stopped", "interrupted", "abandoned"}):
+        return None
+    latest = next((event for value in reversed(run.events)
+                   if (event := readable_event(value)) and event.kind in REPORT_KINDS), None)
+    if latest and (report := latest.report) and latest.kind == run.delivery:
+        projected_remaining = run.remaining if run.terminal else run.remaining or run.requirements
+        if ((report.summary, report.checks, report.remaining) == (run.summary, run.checks, run.remaining)
+                and (task.summary, task.checks, task.remaining) == (run.summary, run.checks, projected_remaining)):
+            return latest
+    return None
+
+
 def encoded_event(kind: str, text: str, *, source: str, run_id: str = "", seq: int = 0,
                   report: Report | None = None) -> str:
     """Assign time/identity once at the producing action, never on display/load."""
     event = Event(str(uuid4()), datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                   kind, source, run_id, seq, text, report)
-    value = PREFIX + json.dumps(asdict(event), ensure_ascii=False, separators=(",", ":"))
+    row = asdict(event)
+    if report is not None:
+        if report.handoff is None:
+            del row["report"]["handoff"]
+        if report.decisions is None:
+            del row["report"]["decisions"]
+        else:
+            for spec in row["report"]["decisions"]:
+                if spec["human_input"] is None:
+                    del spec["human_input"]
+                if spec["routing"] is None:
+                    del spec["routing"]
+    value = PREFIX + json.dumps(row, ensure_ascii=False, separators=(",", ":"))
     parse_event(value)
     return value

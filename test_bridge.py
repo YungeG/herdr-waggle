@@ -1,22 +1,32 @@
 """Actual installed Pi RPC with a deterministic offline provider; all state disposable."""
 import asyncio
-from dataclasses import asdict
 import json
 import os
-from pathlib import Path
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import asdict
+from pathlib import Path
 from uuid import uuid4
 
+from decisions import (
+    EVIDENCE_ONLY_PREFIX,
+    Answer,
+    Target,
+    decision_source,
+    prepare_decision_intent,
+    preview_decisions,
+    review_requirements,
+)
 from journal import parse_event
 from launch import Launch, pi_command
 from model import Board, Run
 from runtime import Runtime, publish
 from store import Store
+from task_context import WorkContract
 
 HERE = Path(__file__).resolve().parent
 
@@ -33,13 +43,34 @@ class PiFixture:
         self.process = None
         self.pumps = []
 
-    async def start(self, *, launcher="direct", launch: Launch | None = None, extra_extensions: tuple[Path, ...] = ()):
-        env = {**os.environ, "PI_CODING_AGENT_DIR": str(self.root / "pi-config"),
+    async def start(self, *, launcher="direct", launch: Launch | None = None, extra_extensions: tuple[Path, ...] = (),
+                    fabric=False, fabric_capture=True, fabric_allowlist: tuple[str, ...] | None = None, fabric_full_code=True,
+                    fabric_approvals: dict[str, str] | None = None):
+        # A fixture must never inherit routing to the owner's real Herdr pane/server.
+        env = {**{key: value for key, value in os.environ.items() if not key.startswith(("HERDR_", "PI_FABRIC_"))},
+               "PI_CODING_AGENT_DIR": str(self.root / "pi-config"),
                "XDG_STATE_HOME": str(self.root / "state"), "XDG_CONFIG_HOME": str(self.root / "config"),
-               "TASKROOM_BRIDGE_DIR": str(self.runtime.root), "TASKROOM_TEST_PROJECT": str(self.project)}
+               "WAGGLE_BRIDGE_DIR": str(self.runtime.root), "WAGGLE_TEST_PROJECT": str(self.project)}
+        if fabric:
+            entry = Path(os.environ.get("WAGGLE_TEST_FABRIC_ENTRY", str(Path.home() / ".pi/agent/npm/node_modules/pi-fabric/dist/index.js")))
+            if not entry.is_file():
+                raise AssertionError(f"Installed Fabric required: {entry}")
+            config = self.root / "pi-config"
+            config.mkdir(exist_ok=True)
+            (config / "fabric.json").write_text(json.dumps({
+                "configVersion": 4, "fullCodeMode": fabric_full_code, "capture": {"enabled": fabric_capture},
+                "approvals": fabric_approvals or {},
+                "agents": {"enabled": False}, "mesh": {"enabled": False}, "memory": {"enabled": False},
+                "mcp": {"enabled": False}, "prewalk": {"enabled": False}, "entropy": {"compile": False},
+                "repairs": {"enabled": False}, "ui": {"enabled": False}, "jev": {"enabled": False},
+            }))
+            extra_extensions = (entry, *extra_extensions)
+            env["WAGGLE_TEST_FABRIC"] = "full" if fabric_full_code else "orchestration"
+            if fabric_allowlist is not None:
+                env["PI_FABRIC_TOOL_ALLOWLIST"] = json.dumps(fabric_allowlist)
         arguments = ["--mode", "rpc", "-e", str(HERE / "fixture-provider.ts"), "--no-skills", "--no-prompt-templates",
                      "--no-context-files", "--offline", "--session-dir", str(self.root / "sessions"),
-                     "--provider", "taskroom-test", "--model", "fixture"]
+                     "--provider", "waggle-test", "--model", "fixture"]
         for extension in extra_extensions:
             arguments.extend(["-e", str(extension)])
         if launch is not None:
@@ -62,7 +93,7 @@ class PiFixture:
         self.pumps = [asyncio.create_task(self._stdout()), asyncio.create_task(self._stderr())]
         response = await self.request("get_commands")
         assert response["success"], response
-        assert sum(item["name"] == "taskroom" for item in response["data"]["commands"]) == 1, (response, self.stderr)
+        assert sum(item["name"] == "waggle" for item in response["data"]["commands"]) == 1, (response, self.stderr)
         if launch is None:
             assert not self.runtime.root.exists(), "Loading the extension must not create a mailbox or consent."
         return self
@@ -107,11 +138,22 @@ class PiFixture:
         await self.send({"id": request_id, "type": command, **fields})
         return await self.event(lambda item: item.get("type") == "response" and item.get("id") == request_id)
 
+    async def native_input(self, message: str, choice: str, *, streaming=None):
+        start, request_id = len(self.events), str(uuid4())
+        await self.send({"type": "prompt", "id": request_id, "message": message,
+                         **({"streamingBehavior": streaming} if streaming else {})})
+        first = await self.event(lambda item: item.get("type") == "agent_start" or
+                (item.get("type") == "extension_ui_request" and item.get("method") == "select"), after=start)
+        assert first.get("type") == "extension_ui_request", "Native input ran before attribution was confirmed"
+        assert choice in first["options"], first
+        await self.send({"type": "extension_ui_response", "id": first["id"], "value": choice})
+        return await self.event(lambda item: item.get("type") == "response" and item.get("id") == request_id, after=start)
+
     async def connect(self, approved=True):
         start = len(self.events)
-        await self.send({"id": str(uuid4()), "type": "prompt", "message": "/taskroom connect"})
+        await self.send({"id": str(uuid4()), "type": "prompt", "message": "/waggle connect"})
         confirmation = await self.event(lambda item: item.get("type") == "extension_ui_request" and item.get("method") == "confirm", after=start)
-        assert confirmation["title"] == "连接 Taskroom", confirmation
+        assert confirmation["title"] == "连接 Waggle", confirmation
         await self.send({"type": "extension_ui_response", "id": confirmation["id"], "confirmed": approved})
         if not approved:
             await self.request("get_state")
@@ -119,7 +161,7 @@ class PiFixture:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             agents = self.runtime.discover()
-            if agents:
+            if agents and agents[0].available:
                 return agents[0]
             await asyncio.sleep(0.05)
         raise AssertionError(f"No joined Pi: {self.stderr}\n{self.events[-12:]}")
@@ -151,11 +193,34 @@ class PiFixture:
 @unittest.skipUnless(shutil.which("pi"), "installed Pi required for the real-runtime offline integration test")
 class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="taskroom-pi-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="waggle-pi-test-")
         self.addCleanup(self.temp.cleanup)
         self.fixture = PiFixture(Path(self.temp.name))
         self.addAsyncCleanup(self.fixture.close)
         await self.fixture.start()
+
+    async def test_agent_handoff_instructions_reach_new_and_native_continuation_turns(self):
+        board, task, run = await self.prepared_run("PARTIAL")
+        self.fixture.runtime.dispatch(run)
+        finished = await self.fixture.result(run)
+        self.assertEqual((finished.state, finished.delivery), ("finished", "partial"))
+        def messages(kind):
+            return [event["message"]["content"] for event in self.fixture.events
+                    if event.get("type") == "message_start" and event.get("message", {}).get("customType") == kind]
+        for phrase in ("brief.outcome", "brief.actions", "brief.verification", "who does what next",
+                       "whether the user needs to decide now", "Do not invent"):
+            self.assertIn(phrase, messages("waggle-task")[0])
+        before = len(self.fixture.events)
+        response = await self.fixture.native_input("Only clarify the current task; do not run a new effect.", "继续当前任务")
+        self.assertTrue(response["success"], response)
+        await self.fixture.event(lambda event: event.get("type") == "message_start" and
+            event.get("message", {}).get("customType") == "waggle-continuation", after=before)
+        for phrase in ("brief.outcome", "brief.actions", "brief.verification", "who does what next",
+                       "whether the user needs to decide now", "Do not invent"):
+            self.assertIn(phrase, messages("waggle-continuation")[0])
+        # PARTIAL deliberately writes an isolated counter before reporting. Native
+        # continuation preserves its immutable old receipt, not an impossible no-file claim.
+        self.assertEqual(self.fixture.runtime.read_run(run), finished)
 
     async def test_real_pi_full_report_settled_persistence_and_no_duplicate_effect(self):
         agent = await self.fixture.connect()
@@ -197,6 +262,52 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
         replayed = self.fixture.runtime.read_run(run)
         assert replayed is not None
         self.assertEqual(asdict(replayed), asdict(result))
+
+    async def test_real_pi_decision_report_saved_then_explicit_new_round(self):
+        agent = await self.fixture.connect()
+        assert agent is not None
+        board = Board(live=True)
+        board.add_project("fixture", str(self.fixture.project))
+        task = board.create("DECISIONS", "fixture", "Only an explicitly chosen offline fixture effect.")
+        board.assign(task, agent.id)
+        run = board.queue_real(task, str(uuid4()), agent.session_id, agent.cwd)
+        with Store(Path(self.temp.name) / "decisions.sqlite3") as store:
+            store.load()
+            store.save(board)
+            self.fixture.runtime.dispatch(run)
+            incoming = await self.fixture.result(run)
+            self.assertEqual((incoming.state, incoming.delivery), ("finished", "partial"))
+            self.assertFalse((self.fixture.project / "fixture-result.json").exists())
+            board.ingest(incoming)
+            store.save(board)
+            self.assertFalse(board.decisions, "A model proposal is never human authority")
+            event = decision_source(board, task.id)
+            assert event.report and event.report.decisions
+            self.assertEqual(event.report.decisions[0].key, "route")
+            answer = Answer("choice", "a")
+            saved = prepare_decision_intent(board, preview_decisions(board, task.id, (answer,), Target("saved")))
+            store.save(board)
+            self.assertEqual(len(board.runs), 1)
+            self.assertFalse((self.fixture.project / "fixture-result.json").exists())
+            target = Target("new_run", agent.id, agent.session_id, agent.cwd)
+            preview = preview_decisions(board, task.id, (Answer(),), target)
+            self.assertIn(saved.record.id, preview.compiled_text)
+            prepared = prepare_decision_intent(board, preview)
+            assert prepared.run is not None
+            store.save(board)
+            restored = store.load()
+            self.assertEqual(restored.decisions[prepared.record.id].intent.run_id, prepared.run.id)
+            self.assertEqual(restored.runs[prepared.run.id].requirements, preview.compiled_text)
+            self.fixture.runtime.dispatch(prepared.run)
+            final = await self.fixture.result(prepared.run)
+            self.assertEqual((final.state, final.delivery), ("finished", "full"))
+            self.assertNotEqual(final.id, incoming.id)
+            board.ingest(final)
+            store.save(board)
+            self.assertEqual(board.runs[incoming.id], incoming)
+            self.assertTrue(task.can_accept)
+            self.assertNotEqual(task.status, "done")
+            self.assertEqual(json.loads((self.fixture.project / "fixture-result.json").read_text())["counter"], 1)
 
     async def test_key_journal_keeps_report_snapshots_and_original_session_not_tool_noise(self):
         board, task, run = await self.prepared_run("HISTORY")
@@ -249,6 +360,14 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
         board.add_project("临时项目", str(self.fixture.project))
         task = board.create(title, "临时项目")
         board.assign(task, agent.id)
+        contract = WorkContract(
+            purpose="implementation",
+            deliverable="完成整任务交付",
+            allowed_scope="项目目录",
+            verification="回归测试通过",
+            exclusions="不修改其他模块",
+        )
+        task.remaining = contract.compile()
         run = board.queue_real(task, str(uuid4()), agent.session_id, agent.cwd)
         return board, task, run
 
@@ -272,7 +391,7 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.state, "failed")
         self.assertIn("过期", result.summary)
         board.ingest(result)
-        board.return_work(task, "明确重派")
+        board.return_work(task, review_requirements("验证停止先于派发", "仅隔离夹具目录", "停止墓碑不得执行 effect"))
         next_run = board.queue_real(task, str(uuid4()), run.session_id, run.cwd)
         self.raw_command(next_run, kind="stop")
         stopped = await self.fixture.result(next_run)
@@ -283,6 +402,19 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         self.assertFalse(file.exists())
         self.assertFalse((self.fixture.project / "fixture-result.json").exists())
+
+    async def test_evidence_only_full_report_rejected_without_execution(self):
+        board, task, run = await self.prepared_run("EVIDENCE_FULL")
+        run.requirements = EVIDENCE_ONLY_PREFIX + "仅整理已有材料；不得执行原任务"
+        self.fixture.runtime.dispatch(run)
+        result = await self.fixture.result(run)
+        self.assertEqual(result.state, "failed")
+        self.assertNotEqual(result.delivery, "full")
+        self.assertFalse((self.fixture.project / "fixture-result.json").exists())
+        board.ingest(result)
+        self.assertFalse(task.can_accept)
+        with self.assertRaises(ValueError):
+            board.accept(task)
 
     async def test_partial_report_is_never_human_acceptance(self):
         board, task, run = await self.prepared_run("PARTIAL")
@@ -318,13 +450,28 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_stop_only_owned_active_run_waits_for_settled(self):
         board, task, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "waggle_fixture_effect")
         working = await self.fixture.result(run, lambda result: result.state == "working")
         self.assertEqual(working.state, "working")
+        observation = self.fixture.runtime.read_activity(working)
+        self.assertIsNotNone(observation, "Native tool start must publish an optional bound snapshot")
+        assert observation is not None
+        self.assertTrue(observation.matches(working))
+        self.assertEqual(observation.tools[0].name, "waggle_fixture_effect")
+        self.assertTrue(observation.bound)
+        self.assertEqual(observation.children, ())
+        self.assertNotIn("slow", (self.fixture.runtime.endpoint(run.agent_id) / "activity.json").read_text())
+        self.assertFalse(any("工具开始" in event for event in working.events))
         board.ingest(working)
         self.fixture.runtime.stop(working)
         result = await self.fixture.result(run)
         self.assertEqual(result.state, "stopped")
+        ended = self.fixture.runtime.read_activity(result)
+        assert ended and ended.last_tool
+        self.assertGreater(ended.seq, observation.seq)
+        self.assertEqual(ended.last_tool.started_at, observation.tools[0].started_at)
+        self.assertTrue(ended.last_tool.is_error)
+        self.assertFalse(ended.bound)
         self.assertTrue(any("agent_settled" in event for event in result.events))
         self.assertFalse(any(event.get("type") == "extension_ui_request" and
                 any(text in event.get("message", "") for text in ("桥接已暂停", "拒绝请求")) for event in self.fixture.events))
@@ -335,7 +482,7 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_busy_pi_rejects_second_attempt_and_crash_stays_unknown(self):
         _, _, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "waggle_fixture_effect")
         working = await self.fixture.result(run, lambda result: result.state == "working")
         another = Run(str(uuid4()), 2, run.agent_id, run.session_id, run.cwd, "FULL", "", "")
         self.raw_command(another)
@@ -403,8 +550,8 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
     async def test_extra_input_loses_ownership_and_bridge_refuses_to_stop(self):
         board, task, run = await self.prepared_run("SLOW")
         self.fixture.runtime.dispatch(run)
-        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "taskroom_fixture_effect")
-        response = await self.fixture.request("prompt", message="Independent human input: do not run another fixture effect.", streamingBehavior="steer")
+        await self.fixture.event(lambda event: event.get("type") == "tool_execution_start" and event.get("toolName") == "waggle_fixture_effect")
+        response = await self.fixture.native_input("Independent human input: do not run another fixture effect.", "独立输入（解除任务关联）", streaming="steer")
         self.assertTrue(response["success"], response)
         unowned = await self.fixture.result(run, lambda result: any("收到额外输入" in event for event in result.events))
         self.fixture.runtime.stop(unowned)
@@ -421,7 +568,7 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_reconnect_uses_new_endpoint_and_never_consumes_old_mail(self):
         _, _, run = await self.prepared_run()
-        response = await self.fixture.request("prompt", message="/taskroom disconnect")
+        response = await self.fixture.request("prompt", message="/waggle disconnect")
         self.assertTrue(response["success"])
         await self.fixture.event(lambda event: event.get("type") == "extension_ui_request" and "已断开" in event.get("message", ""))
         old = self.fixture.runtime.agent(run.agent_id)
@@ -440,11 +587,11 @@ class BridgeSmoke(unittest.IsolatedAsyncioTestCase):
 class BridgeEntrypoints(unittest.IsolatedAsyncioTestCase):
     async def test_project_loader_and_pi_recipe_use_exact_directory_and_require_consent(self):
         for launcher in ("installed", "recipe"):
-            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory(prefix="taskroom-entry-test-") as directory:
+            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory(prefix="waggle-entry-test-") as directory:
                 fixture = PiFixture(Path(directory))
                 try:
                     await fixture.start(launcher=launcher)
-                    self.assertEqual((fixture.project / ".pi/extensions/taskroom.ts").exists(), launcher == "installed")
+                    self.assertEqual((fixture.project / ".pi/extensions/waggle.ts").exists(), launcher == "installed")
                     agent = await fixture.connect()
                     assert agent is not None
                     self.assertEqual(agent.cwd, str(fixture.project))

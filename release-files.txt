@@ -1,0 +1,15 @@
+# Public source allowlist; Git supplies tracked and non-ignored untracked names.
+# Basename patterns also match nested modules. Private/state paths are always excluded.
+*.py
+*.ts
+*.tcss
+README.md
+DEPLOY.md
+LICENSE*
+justfile
+pyrightconfig.json
+release-files.txt
+run.sh
+pi.sh
+.gitignore
+# requirements.txt and checksum/manifests are generated, not copied.

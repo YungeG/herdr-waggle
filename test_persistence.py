@@ -1,27 +1,27 @@
 """Persistent UI behavior and failure handling, only against temporary databases."""
-from copy import deepcopy
-from contextlib import redirect_stderr
 import io
 import os
+import unittest
+from contextlib import redirect_stderr
+from copy import deepcopy
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 
 from textual import events
-from textual.widgets import Button, Input, Static, TextArea
+from textual.widgets import Button, Input, TextArea
 
-from app import Confirm, Note, TaskForm, TaskRoom, main
+from app import Confirm, Note, TaskForm, Waggle, main
 from model import AGENTS, Board, sample_board
 from store import Store
 
 
 class PersistentUITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        temporary = TemporaryDirectory(prefix="taskroom-ui-test-")
+        temporary = TemporaryDirectory(prefix="waggle-ui-test-")
         self.addCleanup(temporary.cleanup)
         self.path = Path(temporary.name) / "task data" / "tasks.sqlite3"
-        self.enterContext(patch.dict(os.environ, {"TASKROOM_BRIDGE_DIR": str(Path(temporary.name) / "bridges")}))
+        self.enterContext(patch.dict(os.environ, {"WAGGLE_BRIDGE_DIR": str(Path(temporary.name) / "bridges")}))
 
     def assert_saved(self, app):
         with Store(self.path) as observer:
@@ -31,7 +31,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
         with Store(self.path) as store:
             store.load()
             store.save(Board())  # Explicit empty simulation fixture; production starts live and empty.
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(80, 24)) as pilot:
                 self.assertEqual(app.board.tasks, {})
                 await pilot.press("p", *"终端工作台", "enter", "n", *"重启恢复", "enter", "e")
@@ -44,7 +44,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
                 self.assert_saved(app)
                 expected = deepcopy(app.board.tasks)
         with Store(self.path) as store:
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(120, 30)) as pilot:
                 self.assertEqual(app.board.tasks, expected)
                 await pilot.pause()
@@ -54,7 +54,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(app.board.tasks[1].status, "blocked")
                 self.assert_saved(app)
         with Store(self.path) as store:
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(80, 24)) as pilot:
                 self.assertEqual(app.board.tasks[1].status, "blocked")
                 await pilot.press("b", *"继续第二阶段", "ctrl+enter")
@@ -63,7 +63,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(app.board.tasks[1].can_accept)
                 self.assert_saved(app)
         with Store(self.path) as store:
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(180, 40)) as pilot:
                 self.assertEqual(app.board.tasks[1].status, "review")
                 self.assertFalse(app.board.tasks[1].can_accept)
@@ -78,13 +78,13 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
                 self.assert_saved(app)
                 expected = deepcopy(app.board.tasks)
         with Store(self.path) as store:
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             self.assertEqual(app.board.tasks, expected)
             self.assertGreater(len(app.board.tasks[1].events), 10)
 
     async def test_failed_create_preserves_form_text_focus_and_disk_then_retries(self):
         with Store(self.path) as store:
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(80, 24)) as pilot:
                 original = app.board
                 store.connection.execute("PRAGMA query_only=ON")
@@ -111,7 +111,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
             task = board.create("原始标题", "终端工作台", "原始说明")
             board.assign(task, AGENTS[0])
             store.save(board)
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(120, 30)) as pilot:
                 original = app.board
                 expected = deepcopy(app.board.tasks)
@@ -141,7 +141,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
         with Store(self.path) as store:
             store.load()
             store.save(sample_board())  # Explicit temporary test fixture, never a startup seed.
-            app = TaskRoom(store=store)
+            app = Waggle(store=store)
             async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.press("slash", *"D003", "escape", "b", *"关键补充不能丢失")
                 original = app.board
@@ -163,7 +163,7 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stale_ui_cannot_overwrite_and_cancel_creates_nothing(self):
         with Store(self.path) as first, Store(self.path) as second:
-            app = TaskRoom(store=first)
+            app = Waggle(store=first)
             newer = second.load()
             async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.press("n", *"取消", "escape")
@@ -182,15 +182,15 @@ class PersistentUITests(unittest.IsolatedAsyncioTestCase):
 
 class EntryTests(unittest.TestCase):
     def test_demo_never_constructs_store(self):
-        with patch("app.Store") as storage, patch("app.Runtime") as runtime, patch("app.TaskRoom.run"):
+        with patch("app.Store") as storage, patch("app.Runtime") as runtime, patch("app.Waggle.run"):
             self.assertEqual(main(["--demo"]), 0)
             storage.assert_not_called()
             runtime.assert_not_called()
 
     def test_local_empty_start_and_invalid_database_failure_are_explicit(self):
-        with TemporaryDirectory(prefix="taskroom-cli-test-") as directory:
+        with TemporaryDirectory(prefix="waggle-cli-test-") as directory:
             path = Path(directory) / "path with spaces" / "tasks.sqlite3"
-            with patch("app.TaskRoom.run") as run:
+            with patch("app.Waggle.run") as run:
                 self.assertEqual(main(["--db", str(path)]), 0)
                 run.assert_called_once()
             with Store(path) as store:
@@ -198,14 +198,14 @@ class EntryTests(unittest.TestCase):
             bad = Path(directory) / "invalid.sqlite3"
             bad.write_bytes(b"do not overwrite")
             stderr = io.StringIO()
-            with patch("app.TaskRoom.run") as run, redirect_stderr(stderr):
+            with patch("app.Waggle.run") as run, redirect_stderr(stderr):
                 self.assertEqual(main(["--db", str(bad)]), 1)
                 run.assert_not_called()
             self.assertIn("启动失败", stderr.getvalue())
             self.assertEqual(bad.read_bytes(), b"do not overwrite")
-            with patch.dict(os.environ, {"XDG_STATE_HOME": directory}), patch("app.TaskRoom.run"):
+            with patch.dict(os.environ, {"XDG_STATE_HOME": directory}), patch("app.Waggle.run"):
                 self.assertEqual(main([]), 0)
-                with Store(Path(directory) / "taskroom/tasks.sqlite3") as store:
+                with Store(Path(directory) / "waggle/tasks.sqlite3") as store:
                     self.assertEqual(store.load().tasks, {})
 
     def test_demo_and_database_arguments_are_mutually_exclusive(self):
