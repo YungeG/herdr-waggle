@@ -11,7 +11,16 @@ from uuid import uuid4
 
 from activity import MAX_ACTIVITY_BYTES, Activity
 from journal import check_history, validate_events
-from model import Run, Supplement, valid_uuid
+from model import Board, Run, Supplement, Task, valid_uuid
+from session_adoption import (
+    AdoptionIntent,
+    AdoptionReceipt,
+    AdoptionRequest,
+    adoption_confirmed,
+    latest_adoption,
+    run_digest,
+)
+from task_context import has_valid_contract, source_base
 
 MAX_BYTES = 1024 * 1024
 HEARTBEAT_SECONDS = 10
@@ -205,15 +214,23 @@ class SessionObservation:
 
     @classmethod
     def from_record(cls, row: dict, run: Run) -> "SessionObservation":
+        return cls._from_identity(row, (run.agent_id, run.session_id, run.cwd))
+
+    @classmethod
+    def for_agent(cls, row: dict, agent: Agent) -> "SessionObservation":
+        return cls._from_identity(row, (agent.id, agent.session_id, agent.cwd))
+
+    @classmethod
+    def _from_identity(cls, row: dict, expected_identity: tuple[str, str, str]) -> "SessionObservation":
         names = {"agent_id", "session_id", "cwd", "seq", "observed_at", "state", "run_id", "linked_run_id", "following", "input_pending"}
         if set(row) != names | {"version"} or type(row["version"]) is not int or row["version"] != 1:
             raise BridgeError("Pi 会话观测协议不兼容。")
         for key in names:
-            expected = bool if key in {"following", "input_pending"} else int if key in {"seq", "observed_at"} else str
-            if type(row[key]) is not expected:
+            field_type = bool if key in {"following", "input_pending"} else int if key in {"seq", "observed_at"} else str
+            if type(row[key]) is not field_type:
                 raise BridgeError("Pi 会话观测字段类型错误。")
         snapshot = cls(**{key: row[key] for key in names})
-        if ((snapshot.agent_id, snapshot.session_id, snapshot.cwd) != (run.agent_id, run.session_id, run.cwd)
+        if ((snapshot.agent_id, snapshot.session_id, snapshot.cwd) != expected_identity
                 or not 0 < snapshot.seq <= 2**53 - 1 or not 0 < snapshot.observed_at <= 2**53 - 1
                 or snapshot.state not in {"idle", "working", "waiting", "offline"}
                 or any(value and not valid_uuid(value) for value in (snapshot.run_id, snapshot.linked_run_id))
@@ -222,6 +239,8 @@ class SessionObservation:
         return snapshot
 
     def check_after(self, previous: "SessionObservation | None") -> None:
+        if previous and (self.agent_id, self.session_id, self.cwd) != (previous.agent_id, previous.session_id, previous.cwd):
+            raise BridgeError("不同连接的观测修订不可比较；须先核对明确纳管回执。")
         if previous and (self.seq < previous.seq or (self.seq == previous.seq and self != previous)):
             raise BridgeError("Pi 会话观测修订倒退或同修订改写。")
 
@@ -256,11 +275,21 @@ class RuntimeUpdates:
     supplement_errors: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class AdoptionBatch:
+    receipts: dict[int, AdoptionReceipt] = field(default_factory=dict)
+    requests: dict[int, AdoptionRequest] = field(default_factory=dict)
+    runs: list[tuple[AdoptionRequest, Run]] = field(default_factory=list)
+    errors: dict[int, str] = field(default_factory=dict)
+
+
 class Runtime:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root if root is not None else bridge_root()
         self._observations: dict[str, tuple[tuple, Path]] = {}
         self._task_observations: set[str] = set()
+        self._adoption_bindings: dict[str, AdoptionIntent] = {}
+        self._adoption_receipts: dict[str, AdoptionReceipt] = {}
 
     def observe(self, run: Run, root: Path, *, follow: bool = False) -> None:
         """Pin one existing run to an explicit read-only source, for this process only."""
@@ -308,7 +337,16 @@ class Runtime:
             raise BridgeError("只读观测的原轮次身份已改变，拒绝读取。")
         return Runtime(root).endpoint(run.agent_id)
 
+    def observation_identity(self, run: Run) -> tuple[str, str, str]:
+        attachment = self._adoption_bindings.get(run.id)
+        if attachment and run.terminal and attachment.source and attachment.source.matches(run):
+            return attachment.agent_id, attachment.session_id, attachment.cwd
+        return run.agent_id, run.session_id, run.cwd
+
     def read_agent(self, run: Run) -> Agent:
+        identity = self.observation_identity(run)
+        if not self.observation_only(run) and identity[0] != run.agent_id:
+            return self.agent(identity[0])
         if not self.observation_only(run):
             return self.agent(run.agent_id)
         agent = Agent.from_record(read_json(self._read_endpoint(run) / "agent.json"))
@@ -344,6 +382,136 @@ class Runtime:
                 if agent.fresh:
                     result.append(agent)
         return sorted(result, key=lambda agent: (agent.cwd, agent.name, agent.id))
+
+    def adoption_capabilities(self, agent: Agent) -> dict:
+        row = read_json(self.endpoint(agent.id) / "adoption-capabilities.json", limit=4096)
+        if (set(row) != {"version", "agent_id", "session_id", "cwd", "pid", "observed_at", "association_id"}
+                or type(row["version"]) is not int or row["version"] != 1
+                or (row["agent_id"], row["session_id"], row["cwd"], row["pid"])
+                != (agent.id, agent.session_id, agent.cwd, agent.pid)
+                or type(row["pid"]) is not int or type(row["observed_at"]) is not int
+                or not -2000 <= int(time.time() * 1000) - row["observed_at"] <= HEARTBEAT_SECONDS * 1000
+                or type(row["association_id"]) is not str
+                or (row["association_id"] and not valid_uuid(row["association_id"]))):
+            raise BridgeError("纳管能力、精确会话或观测新鲜度不符；不创建关联。")
+        return row
+
+    def prepare_adoption(self, board: Board, task: Task, expected: Agent, checkpoint: str,
+                         *, previous_checked: bool = False) -> AdoptionRequest:
+        """Prepare one explicit association; busy native turns may finish without interruption."""
+        if (board.tasks.get(task.id) is not task or task.execution != "pi" or task.retention != "active"
+                or task.status == "done" or not task.description.strip()):
+            raise BridgeError("请选择未验收的真实任务，并明确其独立目标；已验收任务请另建后续。")
+        agent = self.agent(expected.id)
+        if (not agent.fresh or (agent.id, agent.session_id, agent.cwd, agent.pid)
+                != (expected.id, expected.session_id, expected.cwd, expected.pid)
+                or canonical_directory(agent.cwd) != agent.cwd or board.projects.get(task.project) != agent.cwd):
+            raise BridgeError("会话、进程或精确目录已变化；不能按旧选择纳管。")
+        capability = self.adoption_capabilities(agent)
+        if capability["association_id"]:
+            raise BridgeError("此会话已有任务关联；换任务前请在原 Pi 明确解除关联，不接管其他任务。")
+        snapshot = SessionObservation.for_agent(read_json(self.endpoint(agent.id) / "session.json", limit=16384), agent)
+        if (not -2000 <= int(time.time() * 1000) - snapshot.observed_at <= HEARTBEAT_SECONDS * 1000
+                or snapshot.state == "offline" or snapshot.run_id or snapshot.input_pending or agent.active_run):
+            raise BridgeError("会话有已关联执行、待接收输入或观测未知；先核实，不重复纳管。")
+        if any(not run.terminal and (run.task_id == task.id or
+               (run.session_id, run.cwd) == (agent.session_id, agent.cwd)) for run in board.runs.values()):
+            raise BridgeError("任务或同一会话仍有未确认结束的 Run；先核对原执行。")
+        source = board.runs.get(task.run_id) if task.run_id else None
+        if task.run_id and source is None:
+            raise BridgeError("原轮次缺失，不能从会话名称猜测归属。")
+        source_record = None
+        if source is not None:
+            self.require_control(source)
+            if (not source.terminal or (source.task_id, source.session_id, source.cwd, source.title, source.description)
+                    != (task.id, agent.session_id, agent.cwd, task.title, task.description) or not previous_checked):
+                raise BridgeError("只允许明确核对后的同一原会话接续；跨会话仍需独立写者交接。")
+            self.check_current(source, known_session=True)
+            original = self.agent(source.agent_id)
+            stored = Run.from_record(read_json(self._read_endpoint(source) / "runs" / f"{source.id}.json"))
+            if stored != source or original.active_run:
+                raise BridgeError("原轮次或原连接仍有额外执行；先核实，不能用离线代替停止。")
+            source_record = {"run_id": source.id, "agent_id": source.agent_id, "session_id": source.session_id,
+                             "cwd": source.cwd, "seq": source.seq, "digest": run_digest(source), "pid": original.pid}
+            if snapshot.linked_run_id not in {"", source.id}:
+                raise BridgeError("当前会话仍关联其他轮次，不能接管。")
+        elif snapshot.linked_run_id or snapshot.following or previous_checked:
+            raise BridgeError("新任务只能纳管尚未关联的会话，不认领旧任务或旧授权。")
+        requirements = board.compiled_requirements(task)
+        if not has_valid_contract(source_base(requirements)):
+            requirements = "纳管只建立归属；旧授权、预算和已结束轮次不是新增许可。后续操作须遵守当前明确输入及 Pi 权限；不能重放旧任务。"
+        self.check_report_capabilities(agent, requirements)
+        now = int(time.time() * 1000)
+        return AdoptionRequest.from_record({
+            "version": 1, "id": str(uuid4()), "agent_id": agent.id, "session_id": agent.session_id,
+            "cwd": agent.cwd, "pid": agent.pid, "task_id": task.id, "title": task.title,
+            "project": task.project, "description": task.description, "requirements": requirements,
+            "checkpoint": checkpoint.strip(), "source": source_record, "previous_checked": previous_checked,
+            "requested_at": now, "expires": now + 600_000,
+        })
+
+    def publish_adoption(self, request: AdoptionRequest) -> None:
+        intent = request.intent
+        agent = self.agent(intent.agent_id)
+        capability = self.adoption_capabilities(agent)
+        if (not agent.fresh or (agent.session_id, agent.cwd, agent.pid) != (intent.session_id, intent.cwd, intent.pid)
+                or capability["association_id"] or int(time.time() * 1000) > intent.expires):
+            raise BridgeError("纳管目标或确认窗口已变化；不发布，不生成新意图重试。")
+        publish(self.endpoint(intent.agent_id) / "adoptions" / "requests" / f"{intent.id}.json", request.record())
+
+    def _adoption_request(self, intent: AdoptionIntent) -> AdoptionRequest:
+        root = self.endpoint(intent.agent_id) / "adoptions"
+        try:
+            row = read_json(root / "requests" / f"{intent.id}.json")
+        except FileNotFoundError:
+            row = read_json(root / "history" / f"{intent.id}.json")
+        request = AdoptionRequest.from_record(row)
+        if request.intent != intent:
+            raise BridgeError("纳管请求与人工确认摘要不符；不能替换身份或检查点。")
+        return request
+
+    def _adoption_receipt(self, intent: AdoptionIntent) -> AdoptionReceipt:
+        row = read_json(self.endpoint(intent.agent_id) / "adoptions" / "receipts" / f"{intent.id}.json", limit=16384)
+        receipt = AdoptionReceipt.from_record(row, intent)
+        receipt.check_after(self._adoption_receipts.get(intent.id))
+        if receipt.at > int(time.time() * 1000) + 2000:
+            raise BridgeError("纳管回执来自未来时间；不推断成功。")
+        self._adoption_receipts[intent.id] = receipt
+        return receipt
+
+    def read_adoptions(self, board: Board) -> AdoptionBatch:
+        batch = AdoptionBatch()
+        self._adoption_bindings = {}
+        for task in board.tasks.values():
+            if task.retention != "active" or task.status == "done":
+                continue
+            try:
+                intent = latest_adoption(task)
+                if intent is None:
+                    continue
+                intent.validate_task(board, task)
+                if intent.source:
+                    self.require_control(board.runs[intent.source.run_id])
+                request = self._adoption_request(intent)
+                receipt = self._adoption_receipt(intent)
+                batch.requests[task.id], batch.receipts[task.id] = request, receipt
+                if (receipt.state == "attached" and intent.source and task.run_id == intent.source.run_id
+                        and adoption_confirmed(task, intent)):
+                    agent = self.agent(intent.agent_id)
+                    capability = self.adoption_capabilities(agent)
+                    if agent.fresh and capability["association_id"] == intent.id:
+                        self._adoption_bindings[intent.source.run_id] = intent
+                if receipt.state == "consumed":
+                    incoming = self.read_run(Run(receipt.run_id, task.id, intent.agent_id, intent.session_id,
+                                                  intent.cwd, request.title, request.description, request.requirements))
+                    if incoming and incoming.adoption_id:
+                        request.validate_run(incoming)
+                        batch.runs.append((request, incoming))
+            except FileNotFoundError:
+                batch.errors[task.id] = "纳管接收未确认；只观察原意图，不生成新 ID 重发。"
+            except (ValueError, OSError) as error:
+                batch.errors[task.id] = f"纳管状态待核实：{error}；不会自动重试或派发。"
+        return batch
 
     def report_capability_diagnostic(self, agent: Agent, requirements: str = "", *, structured: bool = False,
                                      endpoint: Path | None = None) -> ReportCapabilityDiagnostic:
@@ -497,16 +665,29 @@ class Runtime:
         incoming.check_after(note)
         return incoming
 
-    def check_new_round(self, run: Run) -> None:
-        """Actual new intent requires fresh idle, exact prior ownership, even after save-only."""
+    def check_new_round(self, run: Run, *, adoption: AdoptionIntent | None = None) -> None:
+        """New work still requires fresh idle; an explicit same-session receipt may change transport."""
         self.require_control(run)
         if not run.terminal:
             raise BridgeError('旧轮尚未确认结束；不能创建下一轮意图。')
-        agent = self.read_agent(run)
-        if (agent.id, agent.session_id, agent.cwd) != (run.agent_id, run.session_id, run.cwd):
+        expected = (run.agent_id, run.session_id, run.cwd)
+        if adoption is not None:
+            if not adoption.source or not adoption.source.matches(run):
+                raise BridgeError("纳管回执不属于这个原轮次。")
+            self._adoption_request(adoption)
+            receipt = self._adoption_receipt(adoption)
+            agent = self.agent(adoption.agent_id)
+            capability = self.adoption_capabilities(agent)
+            if receipt.state != "attached" or capability["association_id"] != adoption.id:
+                raise BridgeError("同一会话纳管未确认或已解除；不能派发。")
+            expected = (adoption.agent_id, adoption.session_id, adoption.cwd)
+            self._adoption_bindings[run.id] = adoption
+        else:
+            agent = self.agent(run.agent_id)
+        if (agent.id, agent.session_id, agent.cwd) != expected:
             raise BridgeError('原 Pi 身份不匹配；核实原 Pi 当前活动，不会创建新意图。')
         self.check_current(run, known_session=True)
-        snapshot = self.read_session(run)
+        snapshot = self.read_session(run) if adoption else self._original_session(run)
         if (not agent.available or snapshot is None or snapshot.state != 'idle' or snapshot.input_pending
                 or not -2000 <= int(time.time() * 1000) - snapshot.observed_at <= HEARTBEAT_SECONDS * 1000
                 or snapshot.run_id not in ('', run.id) or snapshot.linked_run_id not in ('', run.id)
@@ -582,12 +763,19 @@ class Runtime:
                 batch.supplement_errors[note.id] = f"补充回执不可读：{error}"
         return batch
 
-    def read_session(self, run: Run) -> SessionObservation | None:
+    def _original_session(self, run: Run) -> SessionObservation | None:
         try:
             row = read_json(self._read_endpoint(run) / "session.json", limit=16 * 1024)
         except FileNotFoundError:
             return None  # Legacy bridges do not attest native session activity.
         return SessionObservation.from_record(row, run)
+
+    def read_session(self, run: Run) -> SessionObservation | None:
+        identity = self.observation_identity(run)
+        if identity[0] != run.agent_id and not self.observation_only(run):
+            agent = self.agent(identity[0])
+            return SessionObservation.for_agent(read_json(self.endpoint(agent.id) / "session.json", limit=16384), agent)
+        return self._original_session(run)
 
     def read_continuations(self, parent: Run, *, limit: int = 8) -> list[Run]:
         if not self.follows_task(parent) or not parent.terminal or parent.state == "abandoned":

@@ -29,7 +29,7 @@ from textual.widgets._select import InvalidSelectValueError
 
 import decision_view
 from app import Choice, Confirm, DispatchNote, NewAgentForm, Waggle
-from decision_view import DecisionReview, DecisionSection, DecisionSheet, DiscardChanges
+from decision_view import DecisionReview, DecisionSheet, DiscardChanges
 from decisions import (
     Answer,
     BusinessAnswer,
@@ -39,7 +39,8 @@ from decisions import (
     preview_decisions,
     prior_answers,
 )
-from journal import Report, encoded_event
+from handoff import Handoff
+from journal import Brief, Report, encoded_event, parse_event
 from launch import prepare_launch
 from report_reader import ReportReader
 from runtime import Agent, Runtime, SessionObservation, private_dir, publish
@@ -58,6 +59,7 @@ def select_intent(form, index, intent):
     """Explicit disposable operator choice, not a production inference/default."""
     form.query_one(f"#intent-{index}", Select).value = intent
     form.change_intent(index)
+    form.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed = False
 
 
 def select_feedback_if_blank(form, index):
@@ -168,6 +170,314 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                 f"error={review.query_one('#decision-error', Static).content}, runtime={app.runtime_errors}"
             )
 
+    async def check_source_bound_preparation(self, target_kind):
+        if target_kind == 'live_supplement':
+            self.use_live_board()
+        app = self.app()
+        before_disk = self.saved_snapshot()
+        before_run = deepcopy(asdict(self.attempt))
+        revision = self.store.revision
+        with patch.object(self.runtime, 'dispatch') as dispatch, patch.object(self.runtime, 'send_supplement') as send:
+            async with app.run_test(size=(80, 24)) as pilot:
+                form = await self.sheet(app, pilot)
+                select_intent(form, 0, 'formal')
+                form.query_one('#answer-0', Select).value = 'choice:b'
+                await pilot.pause()
+                target = (Target(target_kind, self.agent.id, self.agent.session_id, str(self.project))
+                          if target_kind in {'new_run', 'live_supplement'} else Target(target_kind))
+                expected = preview_decisions(app.board, self.task.id, form.answers(), target)
+                original = form.report_view
+                action = 'continue' if target_kind in {'new_run', 'live_supplement'} else target_kind
+                review = await self.review(app, pilot, action)
+                self.assertEqual(review.preview, expected)
+                self.assertEqual(review.preview.fingerprint, expected.fingerprint)
+                self.assertEqual(review.preview.compiled_text, expected.compiled_text)
+                self.assertEqual(str(review.query_one('#decision-preview-text', Static).content), expected.compiled_text)
+                self.assertIs(review.report_view, original)
+                self.assertEqual(review.report_view.source_bytes, self.attempt.events[0])
+                self.assertEqual(encode(app.board), before_disk)
+                self.assertEqual(encode(self.store.load()), before_disk)
+                self.assertEqual(self.store.revision, revision)
+                self.assertEqual(asdict(app.board.runs[self.attempt.id]), before_run)
+                dispatch.assert_not_called()
+                send.assert_not_called()
+                await pilot.press('escape')
+                await wait_ui(pilot, lambda: app.screen is form and not form.busy)
+                self.assertEqual(form.query_one('#answer-0', Select).value, 'choice:b')
+                self.assertEqual(form.report_view, original)
+                self.assertFalse(list(self.runtime.root.glob('*/commands/*.json')))
+                self.assertFalse(list(self.runtime.root.glob('*/supplements/requests/*.json')))
+
+    async def test_source_bound_actual_draft_preparation_equals_original_preview(self):
+        await self.check_source_bound_preparation('draft')
+
+    async def test_source_bound_actual_saved_preparation_equals_original_preview(self):
+        await self.check_source_bound_preparation('saved')
+
+    async def test_source_bound_actual_new_run_preparation_equals_original_preview(self):
+        await self.check_source_bound_preparation('new_run')
+
+    async def test_source_bound_actual_live_preparation_equals_original_preview(self):
+        await self.check_source_bound_preparation('live_supplement')
+
+    async def check_late_source_drift(self, stage, *, live=False):
+        from journal import PREFIX
+        if live:
+            self.use_live_board()
+        app = self.app()
+        before_disk = self.saved_snapshot()
+        entered, release = Event(), Event()
+        async with app.run_test(size=(80, 24)) as pilot:
+            form = await self.sheet(app, pilot)
+            select_intent(form, 0, 'feedback')
+            form.query_one('#comment-0', TextArea).text = '仅核对已有结果；等待来源，不扩权'
+            await pilot.pause()
+            original = form.report_view
+            if stage == 'submit':
+                review = await self.review(app, pilot, 'continue')
+            method = 'check_report_capabilities' if stage == 'prepare' else 'check_supplement' if live else 'agent'
+            check = getattr(self.runtime, method)
+
+            def delayed(*args, **kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError('isolated source-drift barrier not released')
+                return check(*args, **kwargs)
+
+            with patch.object(self.runtime, method, side_effect=delayed), \
+                    patch.object(self.runtime, 'dispatch') as dispatch, \
+                    patch.object(self.runtime, 'send_supplement') as send:
+                try:
+                    if stage == 'prepare':
+                        form.request('continue')
+                    else:
+                        await pilot.click('#decision-confirm')
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                    row = json.loads(original.source_bytes[len(PREFIX):])
+                    changed = PREFIX + json.dumps(row, ensure_ascii=False, indent=2)
+                    self.assertEqual(parse_event(changed), parse_event(original.source_bytes))
+                    self.assertNotEqual(changed, original.source_bytes)
+                    app.board.runs[self.attempt.id].events = [changed]
+                    before_changed = encode(app.board)
+                finally:
+                    release.set()
+                page = form if stage == 'prepare' else review
+                await wait_ui(pilot, lambda: not page.busy and '未提交' in str(page.query_one('#decision-error', Static).content))
+                self.assertEqual(encode(app.board), before_changed)
+                self.assertEqual(encode(self.store.load()), before_disk)
+                self.assertEqual(form.report_view, original)
+                self.assertEqual(form.query_one('#decision-report-envelope', TextArea).text, original.source_bytes)
+                self.assertEqual(form.query_one('#comment-0', TextArea).text, '仅核对已有结果；等待来源，不扩权')
+                dispatch.assert_not_called()
+                send.assert_not_called()
+                self.assertFalse(list(self.runtime.root.glob('*/commands/*.json')))
+                self.assertFalse(list(self.runtime.root.glob('*/supplements/requests/*.json')))
+
+    async def test_prepare_new_run_late_identical_event_reencoding_is_rejected(self):
+        await self.check_late_source_drift('prepare')
+
+    async def test_prepare_live_late_identical_event_reencoding_is_rejected(self):
+        await self.check_late_source_drift('prepare', live=True)
+
+    async def test_submit_new_run_late_identical_event_reencoding_is_rejected(self):
+        await self.check_late_source_drift('submit')
+
+    async def test_submit_live_late_identical_event_reencoding_is_rejected(self):
+        await self.check_late_source_drift('submit', live=True)
+
+    async def check_presentation_owner(self, size):
+        route = routing_payload()
+        route["evidence_needs"] = [
+            {"gap": "原结果待核", "owner": "Main", "source": "fixture/result.json"},
+            {"gap": "累计用量待核", "owner": "资源负责人", "source": "fixture/ledger.json"},
+            {"gap": "代码版本待核", "owner": "Main", "source": "fixture/version.txt"},
+        ]
+        specs = (DecisionSpec.from_record(spec_record(missing=[need["gap"] for need in route["evidence_needs"]],
+                    routing=route)),
+                 DecisionSpec.from_record(spec_record(key="other", missing=["原始回执缺失"], routing=routing_payload())))
+        handoff = Handoff("仅提出合成核查草案，尚未核验", "缺原始结果", "executor", "全局唯一动作：核对已留材料", "none")
+        run = self.attempt
+        raw = encoded_event("partial", "隔离展示样例", source="executor", run_id=run.id, seq=1,
+            report=Report(run.summary, run.checks, run.remaining,
+                Brief(["列出合成资料"], "隔离结果", "尚未独立核验"), specs, handoff))
+        run.events = [raw]
+        before = self.saved_snapshot()
+        app = self.app()
+        async with app.run_test(size=size) as pilot:
+            form = await self.sheet(app, pilot)
+            self.assertEqual(form.report_view.source_bytes, raw)
+            assert form.basis is not None
+            self.assertEqual(form.report_view.source, form.basis.source)
+            self.assertEqual(form.query_one("#decision-report-envelope", TextArea).text, raw)
+            self.assertEqual(form.answers(), (Answer(), Answer()))
+            self.assertTrue(form.query_one("#decision-other-reply-0", Collapsible).collapsed)
+            self.assertIn("待补材料", str(form.query_one("#decision-item-0 .decision-first", Static).content))
+            self.assertIn("全局唯一动作", str(form.query_one("#decision-global-handoff", Static).content))
+            for section in form.query(".decision-item"):
+                self.assertNotIn("全局唯一动作", " ".join(str(w.content) for w in section.query(Static)))
+            for index, gap in enumerate(specs[0].missing, 1):
+                self.assertEqual(str(form.query_one(f"#decision-gap-0-{index}", Static).content), f"{index}. {gap}")
+                self.assertIn(route["evidence_needs"][index-1]["source"],
+                    str(form.query_one(f"#decision-need-source-0-{index}", Static).content))
+            jump = form.query_one("#decision-owner-request-0", Button)
+            jump.scroll_visible(top=True, animate=False)
+            await pilot.pause()
+            self.assertTrue(await pilot.click("#decision-owner-request-0"))
+            await pilot.pause()
+            self.assertFalse(form.query_one("#decision-other-reply-0", Collapsible).collapsed)
+            reply = form.query_one("#answer-0", Select)
+            self.assertTrue(reply.has_focus)
+            viewport = form.query_one("#decision-body", VerticalScroll).content_region
+            frame = "\n".join(strip.text for strip in form._compositor.render_strips())
+            self.assertTrue(viewport.contains_region(reply.region), f"reply={reply.region}, viewport={viewport}\n{frame}")
+            self.assertIn("请解释并补齐材料", "".join(frame.split()))
+            answers = form.answers()
+            expected = preview_decisions(app.board, self.task.id, answers, Target("saved"))
+            review = await self.review(app, pilot, "saved")
+            self.assertIs(review.report_view, form.report_view)
+            self.assertEqual(review.preview, expected)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.runtime.root.glob("*/commands/*.json")))
+
+    async def test_presentation_owner_smoke_at_80_columns(self):
+        await self.check_presentation_owner((80, 24))
+
+    async def test_presentation_owner_at_40_columns(self):
+        await self.check_presentation_owner((40, 20))
+
+    async def test_presentation_owner_at_wide_size(self):
+        await self.check_presentation_owner((130, 50))
+
+    async def test_reply_layout_callback_does_not_focus_an_inactive_item(self):
+        specs = tuple(DecisionSpec.from_record(spec_record(key=key)) for key in ('first', 'second'))
+        run = self.attempt
+        run.events = [encoded_event('partial', '合成双项', source='executor', run_id=run.id, seq=1,
+            report=Report(run.summary, run.checks, run.remaining, decisions=specs))]
+        before = self.saved_snapshot()
+        app = self.app()
+        async with app.run_test(size=(40, 20)) as pilot:
+            form = await self.sheet(app, pilot)
+            form.query_one('#intent-0', Select).value = 'feedback'
+            await pilot.pause()
+            overview = form.query_one('#decision-overview', OptionList)
+            overview.focus()
+            await pilot.pause()
+            original = form.report_view
+            form.reveal_reply(0, 'comment-0')
+            overview.highlighted = 1
+            form.select_item(1)
+            await pilot.pause()
+            self.assertTrue(overview.has_focus)
+            self.assertEqual(form.selected_index, 1)
+            self.assertEqual(form.answers(), (Answer(), Answer()))
+            self.assertFalse(form.query_one('#decision-other-reply-0', Collapsible).collapsed)
+            self.assertTrue(form.query_one('#decision-other-reply-1', Collapsible).collapsed)
+            await pilot.resize_terminal(130, 40)
+            await pilot.pause()
+            self.assertEqual(form.report_view, original)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.runtime.root.glob('*/commands/*.json')))
+
+    async def test_report_view_forgery_rejected_at_prepare_and_submit_without_side_effects(self):
+        from decision_presentation import capture_report_view
+        from journal import PREFIX
+        app = self.app()
+        before = self.saved_snapshot()
+        async with app.run_test(size=(80, 24)) as pilot:
+            form = await self.sheet(app, pilot)
+            select_intent(form, 0, "feedback")
+            form.query_one("#comment-0", TextArea).text = "保留这次反馈，不授权执行"
+            await pilot.pause()
+            original = form.report_view
+            row = json.loads(original.source_bytes[len(PREFIX):])
+            row["report"]["summary"] = "同身份但不是用户原来看的报告"
+            forged = capture_report_view(original.source, PREFIX + json.dumps(row, ensure_ascii=False))
+            forged_event = parse_event(forged.source_bytes)
+            assert forged_event is not None
+            self.assertEqual(forged_event.id, original.source.event_id)
+            form.report_view = forged
+            form.request("saved")
+            await wait_ui(pilot, lambda: "展示" in str(form.query_one("#decision-error", Static).content))
+            self.assertIs(app.screen, form)
+            self.assertEqual(form.query_one("#comment-0", TextArea).text, "保留这次反馈，不授权执行")
+            self.assertEqual(encode(app.board), before)
+            form.report_view = original
+            review = await self.review(app, pilot, "saved")
+            review.report_view = forged
+            await pilot.click("#decision-confirm")
+            await wait_ui(pilot, lambda: "展示" in str(review.query_one("#decision-error", Static).content))
+            self.assertEqual(encode(app.board), before)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.runtime.root.glob("*/commands/*.json")))
+            await pilot.press("escape")
+            await wait_ui(pilot, lambda: app.screen is form)
+            self.assertEqual(form.query_one("#comment-0", TextArea).text, "保留这次反馈，不授权执行")
+
+    async def test_same_event_reencoding_rejects_without_replacing_display_snapshot(self):
+        from journal import PREFIX
+        for stage in ("prepare", "submit"):
+            with self.subTest(stage=stage):
+                app = self.app()
+                before_disk = self.saved_snapshot()
+                async with app.run_test(size=(80, 24)) as pilot:
+                    form = await self.sheet(app, pilot)
+                    select_intent(form, 0, "feedback")
+                    form.query_one("#comment-0", TextArea).text = "仅请核对已有结果"
+                    await pilot.pause()
+                    original = form.report_view
+                    if stage == "submit":
+                        review = await self.review(app, pilot, "saved")
+                        self.assertIs(review.report_view, original)
+                    current = app.board.runs[self.attempt.id]
+                    row = json.loads(original.source_bytes[len(PREFIX):])
+                    changed = PREFIX + json.dumps(row, ensure_ascii=False, indent=1)
+                    self.assertNotEqual(changed, original.source_bytes)
+                    self.assertEqual(parse_event(changed), parse_event(original.source_bytes))
+                    current.events = [changed]
+                    before = encode(app.board)
+                    if stage == "prepare":
+                        form.request("saved")
+                    else:
+                        await pilot.click("#decision-confirm")
+                    await wait_ui(pilot, lambda app=app: "未提交" in str(app.screen.query_one("#decision-error", Static).content))
+                    self.assertEqual(form.report_view, original)
+                    self.assertEqual(form.query_one("#decision-report-envelope", TextArea).text, original.source_bytes)
+                    self.assertEqual(encode(app.board), before)
+                    self.assertEqual(encode(self.store.load()), before_disk)
+                    self.assertFalse(list(self.runtime.root.glob("*/commands/*.json")))
+
+    async def test_global_handoff_fallbacks_do_not_guess_actor_from_actions_or_summary(self):
+        for brief in (None, Brief(["不要从动作猜责任"], "简报结果", "简报核验尚未完成")):
+            with self.subTest(brief=brief):
+                run = self.attempt
+                self.task.summary = run.summary = "不能截取首句代替结论。完整原文第二句。"
+                self.task.checks = run.checks = ["原检查一", "原检查二"]
+                run.events = [encoded_event("partial", "旧报告", source="executor", run_id=run.id, seq=1,
+                    report=Report("不能截取首句代替结论。完整原文第二句。", ["原检查一", "原检查二"], run.remaining,
+                        brief, (DecisionSpec.from_record(spec_record()),)))]
+                # Independent disposable initial report, not a persisted-history overwrite.
+                async def no_submit(*_):
+                    raise AssertionError("Read-only fallback test must not submit")
+                form = DecisionSheet(self.board, self.task.id, no_submit)
+                app = Waggle(board=self.board)
+                async with app.run_test(size=(80, 24)) as pilot:
+                    app.push_screen(form)
+                    await wait_ui(pilot, lambda app=app, form=form: app.screen is form and form.is_mounted)
+                    text = str(form.query_one("#decision-global-handoff", Static).content)
+                    self.assertIn("全局下一责任未提供", text)
+                    self.assertNotIn("不要从动作猜责任", text)
+                    self.assertNotIn("不能截取首句", text)
+                    if brief:
+                        self.assertIn(brief.outcome, text)
+                        self.assertIn(brief.verification, text)
+                    else:
+                        self.assertIn("结论见完整原报告", text)
+                    report = str(form.query_one("#decision-original-report", Static).content)
+                    for original in ("不能截取首句代替结论。完整原文第二句。", "原检查一", "原检查二", run.remaining):
+                        self.assertIn(original, report)
+                    if brief:
+                        self.assertIn(brief.actions[0], report)
+
     async def test_frequent_decision_action_leads_but_final_review_defaults_to_back(self):
         before = self.saved_snapshot()
         app = self.app()
@@ -179,7 +489,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len({button.region.y for button in controls}), 1)
             self.assertEqual([button.region.x for button in controls], sorted(button.region.x for button in controls))
             self.assertFalse(app.board.decisions)
-            self.assertIn("核对方案范围和风险", str(form.query_one("#decision-action-guide-0", Static).content))
+            self.assertIn("旧报告未明确受众", str(form.query_one("#decision-action-guide-0", Static).content))
             self.assertFalse(form.query("#decision-details-0"))
             self.assertFalse(form.query_one("#decision-technical-0").display)
             select_intent(form, 0, "formal")
@@ -254,6 +564,8 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await wait_ui(pilot, lambda: form.selected_index == 1)
             self.assertIn("第 2/4 项", str(navigation.content))
+            form.query_one("#decision-owner-request-1", Button).scroll_visible(top=True, animate=False)
+            await pilot.pause()
             self.assertTrue(await pilot.click("#decision-owner-request-1"))
             review = await self.review(app, pilot, "continue")
             hint = review.query_one("#decision-review-progress", Static)
@@ -469,7 +781,9 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                 app = self.app()
                 async with app.run_test(size=size) as pilot:
                     form = await self.sheet(app, pilot)
-                    self.assertIn("回测负责人提供原始成交回执", " ".join(str(w.content) for w in form.query(".decision-meta").results(Static)))
+                    self.assertIn("提供方（报告原称）：回测负责人", " ".join(str(w.content) for w in form.query(".decision-meta").results(Static)))
+                    self.assertIn("原始成交回执", str(form.query_one("#decision-need-source-0-1", Static).content))
+                    self.assertEqual(str(form.query_one("#decision-gap-0-1", Static).content), "1. 原始回执缺失")
                     self.assertIn("暂不能推荐具体设置值", str(form.query_one("#decision-recommendation-0", Static).content))
                     with self.assertRaises(InvalidSelectValueError):
                         select_intent(form, 0, "formal")
@@ -523,6 +837,8 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             button = form.query_one("#decision-continue", Button)
             self.assertTrue(button.disabled)
             self.assertIn("未选问题不发送", str(form.query_one("#decision-flow", Static).content))
+            form.query_one('#decision-owner-request-0', Button).scroll_visible(top=True, animate=False)
+            await pilot.pause()
             self.assertTrue(await pilot.click("#decision-owner-request-0"))
             await pilot.pause()
             self.assertEqual(form.query_one("#answer-0", Select).value, "request_info")
@@ -752,7 +1068,8 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                     review = await self.review(app, pilot, "saved")
                     summary = str(review.query_one("#decision-review-summary", Static).content)
                     self.assertIn("业务：需要", summary)
-                    self.assertIn("方案：未选择", summary)
+                    self.assertNotIn("方案：未选择", summary)
+                    self.assertNotIn("本项无独立业务问题", summary)
                     self.assertIn("仅本地保存", summary)
                     self.assertTrue(review.query_one("#decision-review-source", Collapsible).collapsed)
                     self.assertIn("业务答案", str(review.query_one("#decision-confirm", Button).label))
@@ -806,7 +1123,9 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     body = form.query_one("#decision-body", VerticalScroll)
                     jump = form.query_one("#decision-reply-0", Button)
-                    self.assertTrue(body.content_region.contains_region(jump.region), f"{size}: reply jump must be visible")
+                    jump.scroll_visible(top=True, animate=False)
+                    await pilot.pause()
+                    self.assertTrue(body.content_region.contains_region(jump.region), f"{size}: reply jump must be reachable without opening details")
                     self.assertTrue(await pilot.click("#decision-reply-0"))
                     await pilot.pause()
                     self.assertTrue(form.query_one("#answer-0", Select).has_focus)
@@ -825,7 +1144,9 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                     details = form.query_one("#decision-details-0", Collapsible)
                     self.assertTrue(details.collapsed)
                     self.assertIn("查看", str(details.title))
-                    self.assertIn("旧状态需核对", str(form.query_one("#decision-gaps-0", Static).content))
+                    self.assertIn("旧状态需核对", str(form.query_one("#decision-gap-0-1", Static).content))
+                    self.assertFalse(any(isinstance(ancestor, Collapsible) and ancestor.collapsed
+                                         for ancestor in form.query_one("#decision-gap-0-1", Static).ancestors))
                     self.assertTrue(form.query_one("#decision-sheet").content_region.contains_region(
                         form.query_one("#decision-continue", Button).region))
                     self.assertEqual(form.query_one("#answer-0", Select).value, "request_info")
@@ -1005,13 +1326,14 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             item = app.query_one("#decision-items", OptionList).get_option_at_index(0)
             self.assertIn("已要求补齐 · 仅本地保存（未发送）", str(item.prompt))
             form = await self.sheet(app, pilot)
-            self.assertIn("你先做什么", str(form.query_one("#decision-action-0", Static).content))
-            self.assertIn("不懂也可以处理", str(form.query_one("#decision-action-guide-0", Static).content))
+            self.assertIn("本项责任与后续", str(form.query_one("#decision-action-0", Static).content))
+            self.assertIn("旧报告未明确受众", str(form.query_one("#decision-action-guide-0", Static).content))
             self.assertIn("用户界定业务需求；经济owner核对规则", str(form.query_one("#decision-owner-0", Static).content))
             self.assertIn("旧单20:00未成交", str(form.query_one("#decision-context-0", Static).content))
-            gaps = str(form.query_one("#decision-gaps-0", Static).content)
-            for missing in spec.missing:
-                self.assertIn(missing, gaps)
+            self.assertIn('3 项', str(form.query_one('#decision-gaps-0', Static).content))
+            for number, missing in enumerate(spec.missing, 1):
+                self.assertEqual(str(form.query_one(f'#decision-gap-0-{number}', Static).content), f'{number}. {missing}')
+                self.assertIn('原报告未逐项提供来源', str(form.query_one(f'#decision-need-source-0-{number}', Static).content))
             self.assertIn("仅本地保存，未发送", str(form.query_one("#decision-previous-0", Static).content))
             self.assertTrue(form.query_one("#decision-continue", Button).disabled)
             self.assertIn("未选问题不发送", str(form.query_one("#decision-flow", Static).content))
@@ -1051,11 +1373,13 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             viewport = form.query_one("#decision-sheet").content_region
             self.assertTrue(viewport.contains_region(form.query_one("#decision-continue", Button).region),
                             "40-column sheet must expose the primary action without scrolling the whole dialog")
+            self.assertTrue(form.query_one("#decision-continue", Button).disabled)
+            self.assertTrue(form.query_one("#decision-other-reply-0", Collapsible).collapsed)
+            form.query_one("#decision-owner-request-0", Button).scroll_visible(top=True, animate=False)
+            await pilot.pause()
             frame = "\n".join(strip.text for strip in form._compositor.render_strips())
-            self.assertIn("你先做什么", frame)
             self.assertIn("请负责人补证本项", frame)
             self.assertIn("核对本单", frame)
-            self.assertTrue(form.query_one("#decision-continue", Button).disabled)
             self.assertTrue(viewport.contains_region(form.query_one("#decision-owner-request-0", Button).region))
             self.assertTrue(await pilot.click("#decision-owner-request-0"))
             await pilot.pause()
@@ -1065,7 +1389,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(details.collapsed)
             details.collapsed = False
             await pilot.pause()  # Expansion changes geometry; scroll only after layout settles.
-            form.query_one("#decision-gaps-0", Static).scroll_visible(top=True, animate=False)
+            form.query_one("#decision-gap-0-2", Static).scroll_visible(top=True, animate=False)
             await pilot.pause()
             later = "\n".join(strip.text for strip in form._compositor.render_strips())
             self.assertIn("取消确认", later)
@@ -1170,7 +1494,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             item = form.query_one("#decision-item-0")
             sections = list(item.query(".decision-section-heading").results(Static))
             self.assertEqual([str(section.content).split(" · ")[0] for section in sections],
-                ["要决定", "你先做什么", "本次答复类型", "具体缺什么", "方案对照", "推荐与边界"])
+                ["待处理事项（旧报告）", "本项责任与后续", "你的回应", "本次答复类型", "核对边界与建议", "方案对照"])
             table = item.query_one("#comparison-wide-0", Static)
             self.assertIsInstance(table.content, Table)
             console = Console(width=72, color_system=None)
@@ -1182,14 +1506,17 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(text, comparison)
             headings = [section.styles.background for section in sections]
             self.assertTrue(all(color is not None for color in headings))
-            self.assertIn("本次答复类型", "\n".join(strip.text for strip in app.screen._compositor.render_strips()))
+            self.assertTrue(item.query_one("#decision-other-reply-0", Collapsible).collapsed)
+            self.assertIn("待处理事项", "\n".join(strip.text for strip in app.screen._compositor.render_strips()))
             self.assertEqual(form.query_one("#answer-0", Select).value, "undecided")
             evidence = item.query_one("#decision-details-0", Collapsible)
             self.assertTrue(evidence.collapsed)
-            evidence.collapsed = False
-            form.query_one("#decision-gaps-0", Static).scroll_visible(top=True, animate=False)
+            form.query_one("#decision-gap-0-1", Static).scroll_visible(top=True, animate=False)
             await pilot.pause()
             self.assertIn("用户确认目标", "\n".join(strip.text for strip in app.screen._compositor.render_strips()))
+            self.assertTrue(evidence.collapsed, 'Gaps must be readable without expanding technical background')
+            evidence.collapsed = False
+            await pilot.pause()
             original = evidence.query_one(Collapsible)
             original.collapsed = False
             await pilot.pause()
@@ -1212,7 +1539,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             overview = form.query_one("#decision-overview", OptionList)
             self.assertIn("待补证", str(overview.get_option_at_index(0).prompt))
             self.assertIn("待补证", str(overview.get_option_at_index(1).prompt))
-            self.assertIn("不懂也可以处理", str(form.query_one("#decision-action-guide-0", Static).content))
+            self.assertIn("旧报告未明确受众", str(form.query_one("#decision-action-guide-0", Static).content))
             form.query_one("#decision-explain-0", Button).scroll_visible(top=True, animate=False)
             await pilot.pause()
             self.assertTrue(await pilot.click("#decision-explain-0"))
@@ -1275,7 +1602,9 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.pause()
             keyboard_switched = form.selected_index == 1 and form.query_one("#decision-item-1").display
-            self.assertTrue(await pilot.click("#decision-overview", offset=(2, 2)))
+            # Text now wraps; target the native row-line map rather than assuming one line per item.
+            row_y = overview._index_to_line[2] - int(overview.scroll_y)
+            self.assertTrue(await pilot.click("#decision-overview", offset=(2, row_y)))
             await pilot.pause()
             mouse_switched = form.selected_index == 2 and form.query_one("#decision-item-2").display
             self.assertTrue(keyboard_switched, f"down did not switch: focus={getattr(app.focused, 'id', None)}")
@@ -1325,7 +1654,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(summary.option_count, 4)
             self.assertTrue(form.query_one("#decision-item-0").display)
             self.assertFalse(form.query_one("#decision-item-3").display)
-            self.assertIn("责任", str(summary.get_option_at_index(0).prompt))
+            self.assertIn("缺口 2 项", str(summary.get_option_at_index(0).prompt))
             self.assertIn("核对本单", str(form.query_one("#decision-continue", Button).label))
             select_intent(form, 0, "feedback")
             form.query_one("#answer-0", Select).value = "preference:a"
@@ -1340,7 +1669,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             self.assertIn("累计已用：未知", str(form.query_one("#budget-facts-3", Static).content))
             self.assertIn("建议新上限（未采纳）：0", str(form.query_one("#budget-facts-3", Static).content))
             self.assertFalse(form.query("#budget-3-attempts"), "缺账本时不能显示正式预算批准输入")
-            full = form.query_one("#decision-item-3", DecisionSection).query_one(Collapsible)
+            full = form.query_one("#decision-details-3", Collapsible)
             self.assertTrue(full.collapsed)
             full.collapsed = False
             await pilot.pause()
@@ -1684,7 +2013,7 @@ class DecisionUI(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(list(self.runtime.root.glob("*/commands/*.json")))
 
     async def test_terminal_offline_exception_never_ignores_another_error_or_ambiguous_session(self):
-        app, candidate, session = self.offline_saved_feedback()
+        app, _, session = self.offline_saved_feedback()
         before = self.saved_snapshot()
         for label, change in (("unrelated issue", None), ("input pending", {"input_pending": True}),
                               ("new linked run", {"following": True, "linked_run_id": str(uuid4())})):

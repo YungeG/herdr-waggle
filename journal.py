@@ -137,7 +137,7 @@ def parse_event(value: str) -> Event | None:
     report = _report(row["report"])
     if source == "executor" and kind not in REPORT_KINDS:
         raise ValueError("执行者来源只能对应明确的自报快照。")
-    if kind in {"created", "edited", "assigned", "dispatched", "returned", "accepted", "abandoned", "archived", "trashed", "restored", "supplement_requested", "supplement_saved", "plan_defined", "step_added", "step_updated"} and source not in {"human", "simulation"}:
+    if kind in {"created", "edited", "assigned", "dispatched", "returned", "accepted", "abandoned", "archived", "trashed", "restored", "supplement_requested", "supplement_saved", "plan_defined", "step_added", "step_updated", "session_adoption_requested"} and source not in {"human", "simulation"}:
         raise ValueError("人工操作记录的来源不正确。")
     if (kind in REPORT_KINDS) != (report is not None) or (report and source not in {"executor", "simulation"}):
         raise ValueError("报告快照与记录类型/来源不一致。")
@@ -169,6 +169,17 @@ def validate_events(values: list[str], *, run_id: str | None = None, seq: int | 
     if len(parents) > 1 or any(event.source != "system" or not event.run_id or
                                _uuid(event.text) == event.run_id for event in parents):
         raise ValueError("执行续接的父轮次标识无效或重复。")
+    adopted = [event for event in events if event.kind == "adopted"]
+    if len(adopted) > 1 or (adopted and parents):
+        raise ValueError("纳管来源不能重复或冒充普通续接。")
+    for event in adopted:
+        row = _object(json.loads(event.text, object_pairs_hook=_unique_object),
+                      {"adoption_id", "parent_run_id", "source_digest"})
+        _uuid(row["adoption_id"])
+        parent = _uuid(row["parent_run_id"], optional=True)
+        source = _text(row["source_digest"], 64)
+        if event.source != "system" or parent == event.run_id or bool(parent) != bool(source) or (source and not re.fullmatch(r"[0-9a-f]{64}", source)):
+            raise ValueError("纳管来源身份或摘要错误。")
     return events
 
 
@@ -177,7 +188,7 @@ def check_history(previous: list[str], incoming: list[str]) -> None:
     old = {event.id: event for value in previous if (event := parse_event(value))}
     new = {event.id: event for value in incoming if (event := parse_event(value))}
     for key, event in old.items():
-        if (key in new and new[key] != event) or (event.kind in {"origin", "continued"} and key not in new):
+        if (key in new and new[key] != event) or (event.kind in {"origin", "continued", "adopted"} and key not in new):
             raise ValueError("原执行的关键记录或 Pi 会话定位被更改，拒绝应用。")
 
 
@@ -190,7 +201,10 @@ def append_event(values: list[str], value: str) -> list[str]:
     gap = next((raw for raw, event in items if event and event.kind == "history_gap"), None)
     kept = [(raw, event) for raw, event in items if not event or event.kind != "history_gap"]
     latest_report = next((raw for raw, event in reversed(kept) if event and event.report), None)
-    protected = {value, latest_report, *(raw for raw, event in kept if event and event.kind in {"origin", "continued"})}
+    attachment_records = {next((raw for raw, event in reversed(kept) if event and event.kind == kind), None)
+                          for kind in ("session_adoption_requested", "session_adopted", "session_adoption_rejected")}
+    protected = {value, latest_report, *attachment_records,
+                 *(raw for raw, event in kept if event and event.kind in {"origin", "continued", "adopted"})}
     while True:
         result = ([gap] if gap else []) + [raw for raw, _ in kept]
         if len(result) <= MAX_EVENTS and len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= MAX_EVENT_BYTES:

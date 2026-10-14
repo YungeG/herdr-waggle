@@ -31,6 +31,7 @@ from textual.errors import NoWidget
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     Collapsible,
     DataTable,
     Footer,
@@ -54,12 +55,14 @@ from budget_ledger import (
     scope_record,
 )
 from budget_view import BudgetForm, BudgetPanel
+from decision_presentation import present_decision, report_view_event
 from decision_view import DecisionReview, DecisionSheet, DiscardChanges
 from decisions import (
     EVIDENCE_ONLY_PREFIX,
     Answer,
     DecisionPreview,
     Target,
+    business_input,
     decision_source,
     feedback_answers,
     feedback_question_key,
@@ -114,7 +117,12 @@ from evidence import (
 )
 from evidence_view import EvidenceForm, EvidenceInventory, EvidenceVerificationForm
 from execution_view import connection_issue, key_updates, status_text
-from failure_view import RECOVERY_MARKER, project_failure, project_ownership
+from failure_view import (
+    RECOVERY_MARKER,
+    project_failure,
+    project_ownership,
+    split_recovery,
+)
 from journal import current_report, last_progress_report, readable_event
 from launch import Launch, connected_agent, create_pi
 from model import (
@@ -133,6 +141,7 @@ from paths import DirectorySuggestions, directory_suggestions
 from records import TaskRecords
 from report_reader import ReportMarkdown, ReportReader, report_markdown
 from runtime import Agent, BridgeError, Runtime, SessionObservation, canonical_directory
+from session_adoption import adoption_confirmed, latest_adoption
 from step_view import StepFlow, StepForm
 from steps import STEP_STATES
 from store import StorageError, Store, default_path, encode
@@ -454,6 +463,89 @@ class RecoveryForm(Dialog):
             self.query_one('#form-error', Static).scroll_visible(animate=False)
             return
         self.dismiss(True)
+
+
+class AdoptionForm(Dialog):
+    """Choose a task/checkpoint in one form; consent never submits work to Pi."""
+    def __init__(self, agent: Agent, tasks: dict[str, Task], default: str,
+                 submit: Callable[[str, str, str, str, bool], Awaitable[bool]]) -> None:
+        super().__init__()
+        self.agent, self.targets, self.default, self.submit = agent, tasks, default, submit
+        self.processing = False
+        self.new_title, self.new_goal = agent.name[:80], ""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="contract-dialog"):
+            yield Static("纳管已有会话 · 不启动工作", classes="dialog-title")
+            with VerticalScroll(classes="form-body"):
+                yield Static(f"Pi：{self.agent.name}\n会话：{self.agent.session_id}\n精确目录：{self.agent.cwd}\n"
+                             "同一会话重连可接续；忙碌时只等待原回合结束，不插话、不停止。", markup=False)
+                yield Static("关联到哪项任务", classes="field-label")
+                yield Select([(f"D{task.id:03} · {task.title}", key) for key, task in self.targets.items()]
+                             + [("＋ 创建独立任务", "new")], value=self.default, allow_blank=False, id="adopt-task")
+                yield Static("任务标题", classes="field-label")
+                yield Input(id="adopt-title", max_length=300)
+                yield Static("独立目标 · 已有任务只读，不导入整段聊天", classes="field-label")
+                yield TextArea("", id="adopt-goal", classes="contract-input")
+                yield Static("从哪个检查点开始 · 必填，最多1800字", classes="field-label")
+                yield TextArea("", id="adopt-checkpoint", classes="contract-input")
+                yield Checkbox("已核对原执行及相关子任务结束；仅接续同一会话", id="adopt-checked")
+                yield Static("确认只建立关联，不创建Run、不派发、不恢复旧预算；后续明确输入/派发才开始新轮。"
+                             "任务事实与历史交付不会从聊天中猜测。", classes="muted")
+                yield Static("", id="form-error", classes="error", markup=False)
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("返回", id="cancel")
+                yield Button("核对并纳管（不启动）", id="submit", variant="primary")
+
+    def on_mount(self) -> None:
+        self.set_target(self.default)
+        self.query_one("#adopt-checkpoint", TextArea).focus()
+
+    @on(Select.Changed, "#adopt-task")
+    def target_changed(self, event: Select.Changed) -> None:
+        if self.is_mounted:
+            self.set_target(str(event.value))
+
+    def set_target(self, key: str) -> None:
+        task = self.targets.get(key)
+        title = self.query_one("#adopt-title", Input)
+        goal = self.query_one("#adopt-goal", TextArea)
+        if not title.disabled:
+            self.new_title, self.new_goal = title.value or self.new_title, goal.text
+        title.value, title.disabled = (task.title, True) if task else (self.new_title, False)
+        goal.text, goal.read_only = (task.description, True) if task else (self.new_goal, False)
+        checkbox = self.query_one("#adopt-checked", Checkbox)
+        checkbox.display, checkbox.value = bool(task and task.run_id), False
+        checkpoint = ""
+        if task:
+            recovered = split_recovery(source_base(task.remaining))
+            if recovered:
+                checkpoint = json.loads(recovered[1])["checkpoint"]
+        self.query_one("#adopt-checkpoint", TextArea).text = checkpoint
+
+    def action_cancel(self) -> None:
+        if not self.processing:
+            super().action_cancel()
+
+    def action_submit(self) -> None:
+        if not self.processing:
+            self.run_worker(self._submit())
+
+    async def _submit(self) -> None:
+        self.processing = True
+        try:
+            result = await self.submit(str(self.query_one("#adopt-task", Select).value),
+                                       self.query_one("#adopt-title", Input).value,
+                                       self.query_one("#adopt-goal", TextArea).text,
+                                       self.query_one("#adopt-checkpoint", TextArea).text,
+                                       self.query_one("#adopt-checked", Checkbox).value)
+            if result:
+                self.dismiss(True)
+        except (ValueError, OSError) as error:
+            self.query_one("#form-error", Static).update(f"未纳管：{error}；输入保留，不派发。")
+            self.query_one("#form-error", Static).scroll_visible(animate=False)
+        finally:
+            self.processing = False
 
 
 class ProjectForm(Dialog):
@@ -1319,6 +1411,8 @@ class Waggle(App):
         self._submission_stages: dict[int, str] = {}
         self._visual_dirty = False
         self._poll_save_error = ""
+        self._adoption_states: dict[int, str] = {}
+        self._adoption_errors: dict[int, str] = {}
         self._primary_action: PrimaryAction | None = None
         self._primary_snapshot: tuple[object, ...] | None = None
         self._primary_task_id: int | None = None
@@ -1732,15 +1826,13 @@ class Waggle(App):
         readonly = bool(task and (task.status == "done" or task.retention != "active"))
         for index, row in enumerate(rows, 1):
             spec = row.spec
-            label = "只读查看" if readonly else "核对记录" if not row.pending else "查看缺口" if not spec.complete else "填写预算" if spec.kind == "budget" else "查看方案"
+            presentation = present_decision(spec, human_input=business_input(spec, row.task_id, row.report_id, spec.key))
+            category = {"owner_evidence": "待补材料", "user_fact": "待答问题",
+                        "user_decision": "待核对方案", "legacy": "待处理事项（旧报告）"}[presentation.category]
+            label = "只读查看" if readonly else "核对记录" if not row.pending else "进入本项"
             text = Text()
-            text.append(f"{index}. {spec.question}", style="bold")
-            text.append(f"  [{row.state}] · {label}", style="#f1b778" if row.pending else "#90d4ad")
-            if not spec.complete:
-                text.append("\n   缺口：" + "；".join(spec.missing or ("未提供依据",)), style="#a9bbd1")
-            else:
-                recommendation = next((o.label for o in spec.options if o.key == spec.recommendation), spec.recommendation)
-                text.append("\n   建议（非默认）：" + recommendation, style="#a9bbd1")
+            text.append(f"{index}. {category} · {presentation.question}", style="bold")
+            text.append(f"\n   [{row.state}] · 缺口 {len(spec.missing)} 项 · {label}", style="#f1b778" if row.pending else "#90d4ad")
             options.append(Option(text, id=row.id))
         widget.clear_options()
         widget.add_options(options)
@@ -2318,9 +2410,7 @@ class Waggle(App):
             self.notify('只有已确认结束且未验收的任务可准备恢复；已验收成果请新建后续。', severity='warning')
             return
         expected, source = deepcopy(task), deepcopy(run)
-        view = project_ownership(task, run, self.agents.get(run.agent_id), self.sessions.get(run.id),
-                                 issue=self.session_errors.get(run.id, ''),
-                                 readonly=bool(self.runtime and self.runtime.observation_only(run)))
+        view = self.ownership_for(task, run)
         status = f'任务 {view.task_state} / Pi {view.pi_state} / 归属 {view.ownership} / 新鲜度 {view.freshness}\n{view.recommended_next_step}'
         def save(contract: WorkContract, checkpoint: str, remaining: str) -> None:
             def prepare(board: Board) -> None:
@@ -2378,7 +2468,13 @@ class Waggle(App):
         if (source is None or source.task_id != task.id
                 or (task.title, task.description, board.projects.get(task.project)) != (source.title, source.description, source.cwd)):
             raise BridgeError('原轮次身份或精确范围不符；不会创建新意图。')
-        self.runtime.check_new_round(source)
+        intent = latest_adoption(task)
+        # A transport override belongs only to its original Run; successors prove their own identity.
+        adoption = intent if (intent and intent.source and intent.source.run_id == source.id
+                              and adoption_confirmed(task, intent)) else None
+        if adoption:
+            adoption.validate_task(board, task)
+        self.runtime.check_new_round(source, adoption=adoption)
 
     def check_dependency_execution(self, board: Board, task: Task, *, agent_id: str | None = None,
                                    requirements: str | None = None, purpose: str | None = None) -> None:
@@ -2435,13 +2531,18 @@ class Waggle(App):
         run = self.board.runs.get(task.run_id)
         return run if run and not run.terminal else None
 
+    def ownership_for(self, task: Task, run: Run):
+        return project_ownership(task, run, self.agents.get(run.agent_id), self.sessions.get(run.id),
+                                 issue=self.session_errors.get(run.id, ''),
+                                 readonly=bool(self.runtime and self.runtime.observation_only(run)),
+                                 current_identity=self.runtime.observation_identity(run) if self.runtime else None)
+
     def report_capability_issue(self, task: Task | None) -> str:
         if not task or not self.runtime or task.execution != "pi" or not task.agent or task.status == "done":
             return ""
         previous = self.board.runs.get(task.run_id)
         if previous and previous.terminal:
-            ownership = project_ownership(task, previous, self.agents.get(previous.agent_id), self.sessions.get(previous.id),
-                                          issue=self.session_errors.get(previous.id, ''), readonly=self.runtime.observation_only(previous))
+            ownership = self.ownership_for(task, previous)
             if 'send_new_round' not in ownership.allowed_actions:
                 return ''  # Current activity/ownership has higher priority than report capability.
         run = previous if task.run != "none" else None
@@ -2480,6 +2581,15 @@ class Waggle(App):
     def primary_action(self, task: Task | None = None) -> PrimaryAction:
         task = self.selected_task if task is None else task
         run = self.board.runs.get(task.run_id) if task else None
+        if (task and task.execution == "pi" and task.status != "done" and task.retention == "active"
+                and (run is None or run.terminal)):
+            adoption_state = self._adoption_states.get(task.id)
+            if adoption_state == "waiting":
+                return PrimaryAction("read_report", "等待会话空闲 · 不启动", "当前原生回合继续，不插话、不停止；接收后只建立关联。")
+            if task.id in self._adoption_errors:
+                return PrimaryAction("adopt_session", "核对纳管状态", self._adoption_errors[task.id])
+            if adoption_state == "attached" and not run:
+                return PrimaryAction("start", "会话已纳管 · 核对新要求 s", "关联不等于执行；可在原会话明确输入，或先填写本轮合同再派发。")
         needs_verification = False
         stop_requested = False
         if task and run and task.execution == "pi" and not run.terminal:
@@ -2507,10 +2617,7 @@ class Waggle(App):
                                       needs_verification=needs_verification, stop_requested=stop_requested,
                                       decisions=decision_items(self.board, task), capability_issue=self.report_capability_issue(task),
                                       dependency_issue=dependency_issue,
-                                      ownership=project_ownership(task, run, self.agents.get(run.agent_id), self.sessions.get(run.id),
-                                          issue=self.session_errors.get(run.id, ''),
-                                          readonly=bool(self.runtime and self.runtime.observation_only(run)))
-                                      if task and run and run.terminal else None)
+                                      ownership=self.ownership_for(task, run) if task and run and run.terminal else None)
 
     @staticmethod
     def primary_button_label(action: PrimaryAction) -> str:
@@ -2660,6 +2767,96 @@ class Waggle(App):
             self.focus_tasks()
             self.notify("项目登记已删除 · 任务及历史在回收站 · 磁盘文件未改动")
         self.push_screen(Confirm("删除项目 · 仅移除登记", body, "删除项目"), confirmed)
+
+    def action_adopt_session(self) -> None:
+        self.run_worker(self.open_adoption())
+
+    async def open_adoption(self) -> None:
+        runtime = self.runtime
+        if not runtime or not self.store:
+            self.notify("纳管需要真实任务库和明确连接；演示与只读观测不升级为控制。", severity="warning")
+            return
+        selected = self.selected_task
+        project = selected.project if selected else self.project_name
+        directory = self.board.projects.get(project, "")
+        if not directory:
+            self.notify("先选择已登记的真实项目目录，再纳管会话。", severity="warning")
+            return
+        agents = await asyncio.to_thread(runtime.discover)
+        if not self.is_running or self.runtime is not runtime or len(self.screen_stack) > 1:
+            return
+        options = {agent.id: agent.label for agent in agents if agent.cwd == directory and not agent.active_run}
+        if not options:
+            self.notify("这个精确目录没有可纳管连接；先连接已有 Pi，不新建第二执行者。", severity="warning", timeout=10)
+            return
+        captured = {agent.id: agent for agent in agents}
+        def chosen(key: str | None) -> None:
+            if key:
+                self.run_worker(self.adoption_form(captured[key], project, directory))
+        self.push_screen(Choice("第一步 · 选择已有会话（不启动）", options,
+                                "只列同目录、无已关联执行的连接；忙碌会话只等待当前回合结束。"), chosen)
+
+    async def adoption_form(self, agent: Agent, project: str, directory: str) -> None:
+        runtime = self.runtime
+        if not runtime or not self.store or self.board.projects.get(project) != directory:
+            return
+        targets = {}
+        for task in self.board.tasks.values():
+            source = self.board.runs.get(task.run_id)
+            if (task.project == project and task.execution == "pi" and task.retention == "active"
+                    and task.status != "done" and task.description.strip()
+                    and (not task.run_id or source and source.terminal
+                         and (source.session_id, source.cwd) == (agent.session_id, directory))):
+                targets[str(task.id)] = deepcopy(task)
+        default = str(self.selected_id) if str(self.selected_id) in targets else "new"
+        async def submit(key: str, title: str, goal: str, checkpoint: str, checked: bool) -> bool:
+            if not self.store or self.runtime is not runtime or self.board.projects.get(project) != directory:
+                raise BridgeError("任务库或目录已变化；请重新核对。")
+            if not title.strip() or not goal.strip() or len(title) > 300 or len(goal) > 20000:
+                raise BridgeError("请明确独立标题与目标，不从会话聊天猜测。")
+            proposed = deepcopy(self.board)
+            if key == "new":
+                task = proposed.create(title, project, goal)
+            else:
+                expected = targets.get(key)
+                if not expected or self.board.tasks.get(expected.id) != expected:
+                    raise BridgeError("原任务已变化；不按旧选择关联。")
+                task = proposed.tasks[expected.id]
+            request = await asyncio.to_thread(runtime.prepare_adoption, proposed, task, agent, checkpoint,
+                                              previous_checked=checked)
+            body = (f"D{task.id:03} · {task.title}\n目标：{task.description}\n目录：{directory}\n"
+                    f"Pi：{agent.name}\n会话：{agent.session_id}\n连接：{agent.id}\n"
+                    f"检查点：{request.intent.checkpoint}\n\n"
+                    "只建立任务关联：不创建Run、不注入模型消息、不重放旧工作、不继承旧预算。"
+                    "忙碌会话只等待原回合完全结束；期间有新输入或身份变化则拒绝。"
+                    "后续明确输入/派发才开始新轮；工具权限与人工验收仍独立。")
+            if not await self.push_screen_wait(Confirm("第二步 · 确认纳管，不启动", body, "确认纳管（不启动）")):
+                return False
+            self._adoption_errors.pop(task.id, None)
+            def persist(board: Board) -> None:
+                if board.projects.get(project) != directory:
+                    raise BridgeError("目录已变化；未发布。")
+                if key == "new":
+                    if board.next_task_id != task.id:
+                        raise BridgeError("新任务身份已变化；保留输入重新核对。")
+                    actual = board.create(title, project, goal)
+                else:
+                    actual = board.tasks[task.id]
+                    if actual != targets[key]:
+                        raise BridgeError("确认期间任务已变化；未发布。")
+                board.request_adoption(actual, request.intent)
+            self.apply_change(persist)
+            self.selected_id = task.id
+            try:
+                await asyncio.to_thread(runtime.publish_adoption, request)
+                self.notify("纳管请求已发布 · 等待会话回执；未启动、未派发工作。", timeout=10)
+            except (ValueError, OSError) as error:
+                self._adoption_errors[task.id] = f"发布未确认：{error}；保留原意图，不生成新ID重发。"
+                self.notify(self._adoption_errors[task.id], severity="warning", timeout=12)
+            self.refresh_tasks()
+            self.schedule_poll()
+            return True
+        self.push_screen(AdoptionForm(agent, targets, default, submit), lambda _: self.refresh_tasks())
 
     async def choose_pi(self, task_id: int, *, start: bool = False, expected: Task | None = None) -> None:
         if not self.runtime:
@@ -2969,8 +3166,40 @@ class Waggle(App):
         if runtime is None:
             self._polling = False
             return
+        try:
+            adoption_batch = await asyncio.to_thread(runtime.read_adoptions, deepcopy(self.board))
+            if not self.is_running or self.runtime is not runtime:
+                self._polling = False
+                return
+            old_states, old_errors = self._adoption_states, self._adoption_errors
+            self._adoption_states = {key: value.state for key, value in adoption_batch.receipts.items()}
+            self._adoption_errors = adoption_batch.errors
+            needs_save = any(not adoption_confirmed(self.board.tasks[key], adoption_batch.requests[key].intent)
+                             and value.state in {"attached", "consumed"}
+                             for key, value in adoption_batch.receipts.items())
+            needs_save |= any(incoming.id not in self.board.runs or incoming.seq > self.board.runs[incoming.id].seq
+                              for _, incoming in adoption_batch.runs)
+            needs_save |= any(value.state in {"rejected", "detached"} and not any(
+                event and event.kind == "session_adoption_rejected" and event.text == value.id
+                for raw in self.board.tasks[key].events if (event := readable_event(raw)) is not None)
+                for key, value in adoption_batch.receipts.items())
+            if needs_save:
+                def ingest_adoptions(board: Board) -> None:
+                    for key, receipt in adoption_batch.receipts.items():
+                        request = adoption_batch.requests[key]
+                        board.apply_adoption(request.intent, receipt)
+                    for request, incoming in adoption_batch.runs:
+                        board.ingest_adopted(request, incoming)
+                self.apply_change(ingest_adoptions)
+                await asyncio.to_thread(runtime.read_adoptions, deepcopy(self.board))  # Bind telemetry only after consent commits.
+            if needs_save or old_states != self._adoption_states or old_errors != self._adoption_errors:
+                self.refresh_tasks()
+        except (ValueError, OSError, StorageError) as error:
+            self.notify(f"纳管回执未保存：{error}；仅重读，不重新发布。", severity="warning", timeout=10)
         tracked = [deepcopy(self.board.runs[task.run_id]) for task in self.board.tasks.values()
-                   if task.execution == "pi" and task.run != "none" and task.run_id in self.board.runs
+                   if task.execution == "pi" and task.run_id in self.board.runs
+                   and (task.run != "none" or (intent := latest_adoption(task)) is not None
+                        and adoption_confirmed(task, intent))
                    and task.status != "done" and task.retention == "active"]
         ancestors = {old.id: old for run in tracked for old in self.board.lineage(run)
                      if not runtime.observation_only(run) or runtime.observation_only(old)}
@@ -3009,7 +3238,11 @@ class Waggle(App):
                 snapshot = batch.sessions.get(run.id)
                 if snapshot:
                     try:
-                        snapshot.check_after(self.sessions.get(run.id))
+                        prior = self.sessions.get(run.id)
+                        if (prior and prior.agent_id != snapshot.agent_id
+                                and runtime.observation_identity(run) == (snapshot.agent_id, snapshot.session_id, snapshot.cwd)):
+                            prior = None  # A proved new transport has its own revision counter.
+                        snapshot.check_after(prior)
                         self.sessions[run.id] = snapshot
                     except ValueError:
                         self.session_errors[run.id] = "Pi 会话观测修订倒退或改写"
@@ -3027,6 +3260,7 @@ class Waggle(App):
                     != (after.online, after.session_id, after.cwd, after.idle, after.active_run, after.name, after.model)))
                 if after:
                     self.agents[run.agent_id] = after
+                    self.agents[after.id] = after
                 else:
                     self.agents.pop(run.agent_id, None)
                 if errors.get(run.id) != self.runtime_errors.get(run.id):
@@ -3177,6 +3411,7 @@ class Waggle(App):
             options["evidence"] = "成果库存 · 选定引用 / 独立人工核验（不派发）"
             options["dependencies"] = "局部依赖 · 条件核对 / 原写者释放 / 独立接收（不派发）"
             options["budget"] = "累计预算账本 · 独立核验（正式批准未启用）"
+            options["adopt_session"] = "纳管已有会话 · 接续 / 独立任务（不启动）"
         if task.status == "done" and task.execution == "pi":
             options["followup"] = "基于已验收成果创建后续草稿（不派发）"
         if task.status in ("draft", "ready") and task.run == "none":
@@ -3193,7 +3428,8 @@ class Waggle(App):
             action = {"activity": self.action_activity, "toggle_detail": self.action_toggle_detail,
                       "steps": self.action_steps, "followup": self.action_followup, "evidence": self.action_evidence,
                       "dependencies": self.action_dependencies, "budget": self.action_budget,
-                      "work_contract": self.action_work_contract, "prepare_recovery": self.action_prepare_recovery}.get(key)
+                      "work_contract": self.action_work_contract, "prepare_recovery": self.action_prepare_recovery,
+                      "adopt_session": self.action_adopt_session}.get(key)
             if action:
                 action()
         self.push_screen(Choice(f"D{selected_id:03} · 更多任务工具", options,
@@ -3346,6 +3582,12 @@ class Waggle(App):
                 raise BridgeError("窗口或运行时已变化；不会提交。")
             assert form.basis is not None
             validate_preview(self.board, form.basis)
+            event = report_view_event(form.report_view)
+            assert event.report is not None
+            if (form.report_view.source != form.basis.source or event.report.decisions != form.specs
+                    or event != decision_source(self.board, form.task_id)
+                    or self.board.runs[form.basis.source.run_id].events.count(form.report_view.source_bytes) != 1):
+                raise BridgeError("原报告展示与当前来源不一致；保留输入，请重新核对。")
             return self.board.tasks[form.task_id]
         task = check()
         form.set_processing_stage("核对来源与本单答案（尚未提交）")
@@ -3426,7 +3668,7 @@ class Waggle(App):
             check()
             heading, rest = label.split("\n", 1)
             label = f"{heading}\n接收方：{candidate.name} · {candidate.model}\n{rest}"
-        review = DecisionReview(preview, label, self.submit_decision_preview)
+        review = DecisionReview(preview, label, self.submit_decision_preview, report_view=form.report_view)
         form.set_processing_stage("等待你最后核对（尚未提交）")
         confirmed = await self.push_screen_wait(review)
         if confirmed and form.is_running:
@@ -3438,8 +3680,16 @@ class Waggle(App):
                 or not self.screen.busy or self._sending):
             raise BridgeError("需要在人工汇总核对窗口明确确认；不会从报告或普通文本建立批准。")
         review = self.screen
+        def check_display() -> None:
+            validate_preview(self.board, preview)
+            event = report_view_event(review.report_view)
+            assert event.report is not None
+            if (review.report_view.source != preview.source or event.report.decisions != preview.specs
+                    or event != decision_source(self.board, preview.task_id)
+                    or self.board.runs[preview.source.run_id].events.count(review.report_view.source_bytes) != 1):
+                raise BridgeError("原报告展示与本次确认来源不一致；保留输入，不保存或发送。")
         review.set_processing_stage("重新核对来源与本次答案")
-        validate_preview(self.board, preview)
+        check_display()
         if preview.target.kind in {"draft", "saved"}:
             review.set_processing_stage("保存本地记录（不发送）")
             self.apply_change(lambda board: prepare_decision_intent(board, preview))
@@ -3465,7 +3715,7 @@ class Waggle(App):
             if (not self.is_running or not review.is_running or self.screen is not review or self.runtime is not runtime
                     or not fresh.available or (fresh.id, fresh.session_id, fresh.cwd) != (preview.target.agent_id, preview.target.session_id, preview.target.cwd)):
                 raise BridgeError("连接、目录、会话或窗口已变化；未保存、未派发。")
-            validate_preview(self.board, preview)
+            check_display()
             await self.dispatch_task(task, fresh, decision=preview, progress=review.set_processing_stage)
 
     def available_supplement_mode(self, task: Task | None) -> str | None:
@@ -4024,6 +4274,7 @@ class Waggle(App):
             if not task or task.retention == "active":
                 actions["new_agent"] = "管理 · 新建 Pi · 独立标签页并连接"
             actions["pi_help"] = "恢复与诊断 · 接入已有 / 新开 Pi · 连接帮助"
+            actions["adopt_session"] = "日常 · 纳管已有会话 · 接续任务 / 创建独立任务（不启动）"
         if task:
             actions["activity"] = "日常 · 任务记录 · 关键变化与历史轮次（只读）"
             actions["toggle_detail"] = "日常 · 收起详情" if self.detail_expanded else "日常 · 展开详情 · 完整交付与任务要求"

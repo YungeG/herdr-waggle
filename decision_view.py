@@ -1,4 +1,5 @@
 """Human decision sheet: drafts, confirmed local records and explicit delivery."""
+import json
 from collections.abc import Awaitable, Callable
 from contextlib import nullcontext
 
@@ -23,12 +24,19 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
+from decision_presentation import (
+    ReportViewSnapshot,
+    capture_report_view,
+    present_decision,
+    report_view_event,
+)
 from decisions import (
     Answer,
     BusinessAnswer,
     DecisionOption,
     DecisionPreview,
     DecisionSpec,
+    Source,
     Target,
     answer_text,
     business_input,
@@ -40,6 +48,7 @@ from decisions import (
     request_only_decisions,
     unchanged_evidence_keys,
 )
+from journal import PREFIX, parse_event
 from model import Board
 from store import StorageError
 
@@ -108,6 +117,51 @@ def _d002_plain_help(task_id: int, source_event_id: str, key: str) -> tuple[str,
     return _D002_PLAIN.get(key) if task_id == 2 and source_event_id == _D002_REPORT_ID else None
 
 
+_CATEGORY_LABELS = {"owner_evidence": "待补材料", "user_fact": "待答问题",
+                    "user_decision": "待核对方案", "legacy": "待处理事项（旧报告）"}
+
+
+def _global_text(snapshot: ReportViewSnapshot) -> str:
+    report = report_view_event(snapshot).report
+    assert report is not None
+    if report.handoff:
+        handoff = report.handoff
+        actor = {"executor": "执行方", "user": "用户", "none": "报告未指定下一责任"}[handoff.next_actor]
+        need = {"none": "无需用户输入", "input": "需用户补充信息", "decision": "需用户核对决定"}[handoff.user_need]
+        return ("本轮情况（执行方自报）\n" + handoff.result + "\n阻碍：" + (handoff.blocker or "报告未列全局阻碍")
+                + f"\n全局交接：{actor} · {handoff.next_action}\n用户操作（报告自报）：{need}；不是执行许可。")
+    if report.brief:
+        return ("本轮情况（执行方自报）\n" + report.brief.outcome + "\n核对情况（自报）：" + report.brief.verification
+                + "\n全局下一责任未提供；不从动作列表推断许可。")
+    return "收到本轮报告；未提供短交接，结论见完整原报告。\n全局下一责任未提供；不推断继续执行许可。"
+
+
+def _report_text(snapshot: ReportViewSnapshot) -> str:
+    # Display only fields present in the retained envelope; raw bytes stay separately retrievable.
+    report_view_event(snapshot)
+    fields = json.loads(snapshot.source_bytes[len(PREFIX):])["report"]
+    labels = {"summary": "报告正文", "checks": "检查记录（自报；保留原顺序）", "remaining": "剩余事项与限制",
+              "brief": "简报", "decisions": "完整决策项", "handoff": "原全局交接"}
+    return "\n\n".join(labels[key] + "：\n" + (value if isinstance(value, str) else
+                          json.dumps(value, ensure_ascii=False, indent=2)) for key, value in fields.items())
+
+
+def _advice_text(spec: DecisionSpec) -> str:
+    if not spec.routing:
+        return (f"旧报告建议（未结构化核验）：{spec.recommendation}\n理由：{spec.reason}；不作默认选择。"
+                "\n重要未知项：未提供结构化不确定性；签收状态未提供。")
+    advice = spec.routing.advice
+    proposal = (f"建议（非批准）：{advice.value} {advice.unit}\n适用条件：{advice.conditions}"
+                if advice.status == "supported" else "证据不足：暂不能推荐具体设置值；等待负责人材料。")
+    return (proposal + "\n重要未知项：" + advice.uncertainty
+            + f"\n负责人签收：{'是' if advice.owner_signed else '否'}（报告自报；不是独立核验或本次批准）")
+
+
+def _boundary_text(spec: DecisionSpec) -> str:
+    return (f"本项范围：{spec.scope}\n风险：{spec.risk}\n代价：{spec.cost}\n排除："
+            + ("；".join(spec.exclusions) or "仍受原任务范围限制"))
+
+
 class DiscardChanges(ModalScreen[bool]):
     """Safe editor exit; neither choice persists, confirms or publishes anything."""
     BINDINGS = [Binding("escape", "keep", "继续编辑"), Binding("ctrl+enter", "keep", "继续编辑", priority=True)]
@@ -142,9 +196,14 @@ class DecisionReview(ModalScreen[bool]):
     BINDINGS = [Binding("escape", "back", "返回修改")]
 
     def __init__(self, preview: DecisionPreview, target_label: str,
-                 commit: Callable[[DecisionPreview], Awaitable[None]]) -> None:
+                 commit: Callable[[DecisionPreview], Awaitable[None]], *, report_view: ReportViewSnapshot) -> None:
         super().__init__()
+        event = report_view_event(report_view)
+        assert event.report is not None
+        if report_view.source != preview.source or event.report.decisions != preview.specs:
+            raise ValueError("原报告展示与本次确认材料不一致；请保留输入并重新核对。")
         self.preview, self.target_label, self.commit = preview, target_label, commit
+        self.report_view = report_view
         self.busy = False
 
     def set_processing_stage(self, message: str) -> None:
@@ -173,10 +232,15 @@ class DecisionReview(ModalScreen[bool]):
                    "本次：发送反馈／请求建议，仅核对已有材料；不批准方案" if request_only and self.target_label.startswith("反馈／") else
                    "本次：仅发送补证请求，不实施方案" if request_only else
                    "本次：提交已选方案，可能执行真实任务；仍需 Pi 权限确认")
-        lines = [f"所属任务：D{self.preview.task_id:03} · {self.preview.context.title}", heading]
+        unselected = sum(answer == Answer() and not prior for answer, prior in zip(self.preview.answers, self.preview.prior, strict=True))
+        lines = [f"所属任务：D{self.preview.task_id:03} · {self.preview.context.title}", heading,
+                 f"本单 {len(self.preview.specs)} 项 · 未选 {unselected} 项；未选项不发送"]
         for index, (spec, answer, prior) in enumerate(zip(self.preview.specs, self.preview.answers, self.preview.prior, strict=True), 1):
+            if answer == Answer() and not prior:
+                continue
+            presentation = present_decision(spec, human_input=business_input(spec, self.preview.task_id, self.preview.source.event_id, spec.key))
             plain = _d002_plain_help(self.preview.task_id, self.preview.source.event_id, spec.key)
-            question = plain[0] if plain else spec.question
+            question = plain[0] if plain else presentation.question
             if answer.business is not None:
                 source = answer.business.question or business_input(spec, self.preview.task_id, self.preview.source.event_id, spec.key)
                 if source is not None:
@@ -186,10 +250,7 @@ class DecisionReview(ModalScreen[bool]):
                     label += "（尚无业务结论）"
                 business = label + ("；条件：" + answer.business.detail if answer.business.detail else "")
             else:
-                question_input = business_input(spec, self.preview.task_id, self.preview.source.event_id, spec.key)
-                business = ("未回答" if question_input else
-                            "等负责人补证，无需你填写" if plain and plain[3] == "等负责人补证" else
-                            "本项无独立业务问题")
+                business = ""
             scope = ""
             if prior:
                 solution = "沿用此前确认的决定（展开原文核对）"
@@ -203,6 +264,7 @@ class DecisionReview(ModalScreen[bool]):
             elif answer.kind == "preference":
                 option = next(o for o in spec.options if o.key == answer.choice)
                 solution = "仅表达倾向：" + option.label + "（不授权）"
+                scope = option.scope
             else:
                 solution = {"undecided": "未选择", "request_info": "请解释、补材料", "defer": "暂缓", "reject": "拒绝"}.get(answer.kind, "待核对")
             intent = ("正式决定" if answer.kind in {"choice", "approve", "budget"} or prior else
@@ -211,19 +273,28 @@ class DecisionReview(ModalScreen[bool]):
                       "反馈/追问（非授权）" if answer.kind != "undecided" or answer.comment.strip() else "未选 · 本次不发送")
             lines.append(f"{index}. 针对的问题：{question}\n"
                          f"   问题来源：D{self.preview.task_id:03} · 当前报告第{index}项 · 版本{self.preview.source.seq}\n"
-                         f"   本次答复：\n     业务：{business}\n     方案：{solution}")
+                         "   本次答复：")
+            if business:
+                lines.append("     业务：" + business)
+            if prior or answer.kind in {"choice", "approve", "preference"}:
+                lines.append("     方案：" + solution)
+            elif answer.kind != "undecided":
+                lines.append("     回应：" + solution)
+            elif not business:
+                lines.append("     反馈：仅本次备注（非授权）")
             if scope:
                 lines.append("     范围：" + scope)
             lines.append("   意图：" + intent)
             if answer.comment:
                 lines.append("   备注（不扩权）：" + answer.comment)
-            if answer.kind in {"choice", "approve"} or prior:
-                lines.append("   风险：" + spec.risk + "；代价：" + spec.cost)
-                if answer.kind == "choice":
-                    chosen = next(o for o in spec.options if o.key == answer.choice)
-                    if (chosen.risk, chosen.cost) != (spec.risk, spec.cost):
-                        lines.append("   所选方案风险/代价：" + chosen.risk + " / " + chosen.cost)
-                lines.append("   排除：" + ("；".join(spec.exclusions) or "仍受原任务范围限制"))
+            lines.extend("   " + line for line in _boundary_text(spec).splitlines())
+            if answer.kind in {"choice", "preference"}:
+                chosen = next(o for o in spec.options if o.key == answer.choice)
+                if (chosen.risk, chosen.cost) != (spec.risk, spec.cost):
+                    lines.append("   所选方案风险/代价：" + chosen.risk + " / " + chosen.cost)
+            lines.extend("   " + line for line in _advice_text(spec).splitlines())
+            if spec.missing:
+                lines.append("   待补材料（未核实）：" + "；".join(spec.missing))
         return "\n".join(lines)
 
     def confirm_label(self) -> str:
@@ -260,11 +331,16 @@ class DecisionReview(ModalScreen[bool]):
                     target = (lines[0] + "\n提交目标：\n  " + receiver + "\n  目录：" + self.preview.target.cwd
                               + "\n确认后果：\n  " + lines[-1])
                     yield Static(_ReviewText(target), id="decision-target", markup=False)
-                with Collapsible(title="完整原文、连接和报告来源 · 按需展开", collapsed=True, id="decision-review-source"):
+                with Collapsible(title="本次实际提交文本（权威全文）", collapsed=self.preview.target.kind not in {"new_run", "live_supplement"},
+                                 id="decision-submit-text", classes="decision-details"):
+                    yield Static(_ReviewText(self.preview.compiled_text), id="decision-preview-text", markup=False)
+                with Collapsible(title="完整原报告（来源快照）与连接 · 按需展开", collapsed=True, id="decision-review-source",
+                                 classes="decision-details"):
                     yield Static(self.target_label, markup=False)
                     yield Static("原任务范围：\n" + self.preview.context.description, markup=False)
-                    yield Static(f"报告来源：{self.preview.source.run_id}\n报告修订：{self.preview.source.seq} · {self.preview.source.event_id}", markup=False, classes="muted")
-                    yield TextArea(self.preview.compiled_text, read_only=True, id="decision-preview-text")
+                    yield Static(f"报告来源：{self.report_view.source.run_id}\n报告修订：{self.report_view.source.seq} · {self.report_view.source.event_id}", markup=False, classes="muted")
+                    yield Static(_report_text(self.report_view), id="decision-review-report", markup=False)
+                    yield TextArea(self.report_view.source_bytes, read_only=True, id="decision-review-envelope", classes="decision-envelope")
             with Grid(classes="decision-controls"):
                 yield Button(self.confirm_label(), id="decision-confirm", variant="primary")
                 yield Button("返回修改", id="decision-back")
@@ -328,18 +404,28 @@ class DecisionSheet(ModalScreen):
         self.task_id, self.prepare = task_id, prepare
         self.focus_key = focus_key
         event_task = board.tasks[task_id]
-        self.title_text = f"D{task_id:03} · {event_task.title} · 决策单"
+        self.title_text = f"D{task_id:03} · {event_task.title} · 待处理事项"
         source = decision_source(board, task_id)
         assert source.report and source.report.decisions
         self.specs = source.report.decisions
         self.source_event_id = source.id
         source_run = board.runs.get(event_task.run_id)
+        if source_run is None:
+            raise ValueError("原报告轮次缺失；不补造展示快照。")
+        envelopes = [raw for raw in source_run.events if parse_event(raw) == source]
+        if len(envelopes) != 1:
+            raise ValueError("原报告 envelope 缺失或不唯一；不补造展示快照。")
+        self.report_view = capture_report_view(Source(source.run_id, source.id, source.seq), envelopes[0])
         self.question_only = bool(source_run and question_question(source_run.requirements) is not None)
         self.business_inputs = tuple(business_input(spec, task_id, source.id, spec.key) for spec in self.specs)
+        self.presentations = tuple(present_decision(spec, human_input=question)
+                                   for spec, question in zip(self.specs, self.business_inputs, strict=True))
         self.selected_index = next((i for i, spec in enumerate(self.specs) if spec.key == focus_key), 0)
         self.needs_evidence = any(not spec.complete or spec.kind == "budget" for spec in self.specs)
         self.readonly = event_task.status == "done" or event_task.retention != "active"
         self.basis = None if self.readonly else preview_decisions(board, task_id, tuple(Answer() for _ in self.specs), Target("draft"))
+        if self.basis and self.report_view.source != self.basis.source:
+            raise ValueError("原报告展示与表单来源不一致；不能继续。")
         self.previous = prior_answers(board, task_id)
         self.business_history = tuple(historical_business_fact(board, task_id, spec.key) if question else None
                                       for spec, question in zip(self.specs, self.business_inputs, strict=True))
@@ -423,9 +509,10 @@ class DecisionSheet(ModalScreen):
         plain = _d002_plain_help(self.task_id, self.source_event_id, spec.key)
         if plain:
             return f"{index + 1}. {status} · {plain[0]}"
-        question = spec.question[:14] + ("…" if len(spec.question) > 14 else "")
-        owner = spec.owner[:6] + ("…" if len(spec.owner) > 6 else "")
-        return f"{index + 1}. {status} · {question} · 责任：{owner}"
+        presentation = self.presentations[index]
+        category = _CATEGORY_LABELS[presentation.category]
+        question = "" if len(self.specs) == 1 else " · " + presentation.question
+        return f"{index + 1}. {category} · {status} · 缺口 {len(spec.missing)} 项{question}"
 
     def intent_options(self, index: int) -> list[tuple[str, str]]:
         choices = [("暂未选择", "")]
@@ -512,80 +599,82 @@ class DecisionSheet(ModalScreen):
                 error = Static("已验收/归档任务只读。" if self.readonly else "", id="decision-error", classes="error", markup=False)
                 error.can_focus = True
                 yield error
-                for index, (spec, initial) in enumerate(zip(self.specs, self.initial, strict=True)):
+                yield Static(_global_text(self.report_view), id="decision-global-handoff", classes="decision-meta", markup=False)
+                for index, (spec, initial, presentation) in enumerate(zip(self.specs, self.initial, self.presentations, strict=True)):
                     classes = "decision-item" + (" decision-inactive" if index != self.selected_index else "")
                     with DecisionSection(classes=classes, id=f"decision-item-{index}"):
                         plain = _d002_plain_help(self.task_id, self.source_event_id, spec.key)
-                        yield Static(f"要决定 · {index + 1}/{len(self.specs)}", classes="decision-section-heading decision-first", markup=False)
-                        yield Static(plain[0] if plain else spec.question, classes="decision-question", markup=False)
                         unresolved = not spec.complete or spec.kind == "budget"
-                        if unresolved and self.business_inputs[index]:
-                            yield Button("回答业务问题 ↓", id=f"decision-reply-{index}",
-                                         classes="decision-reply-jump decision-business-jump", disabled=self.readonly)
-                            yield from self.reply_controls(index, spec, initial)
-                        yield Static("你先做什么", id=f"decision-action-{index}", classes="decision-section-heading", markup=False)
-                        if unresolved and not self.business_inputs[index]:
-                            yield Button("请负责人补证本项", id=f"decision-owner-request-{index}",
-                                         classes="decision-reply-jump", disabled=self.readonly)
-                            yield Button("其他意见 ↓",
-                                         id=f"decision-reply-{index}", classes="decision-reply-jump", disabled=self.readonly)
-                        if spec.routing and spec.routing.audience == "owner_evidence":
-                            yield Static("等待负责人 · " + ("；".join(f"{need.owner}提供{need.source}" for need in spec.routing.evidence_needs) or spec.owner)
-                                         + "；可反馈，但不要选技术方案。", classes="decision-meta", markup=False)
-                        yield Static("你来回答 · " + plain[1] if plain else
-                                     "不懂也可以处理：不必填写；只写你清楚的业务目标，技术证据请负责人提供。" if unresolved else
-                                     "核对方案范围和风险；不确定就先请解释，不要猜。正式选择后仍需确认。", id=f"decision-action-guide-{index}", classes="decision-meta", markup=False)
+                        yield Static(f"{_CATEGORY_LABELS[presentation.category]} · {index + 1}/{len(self.specs)}",
+                                     classes="decision-section-heading decision-first", markup=False)
+                        yield Static(plain[0] if plain else presentation.question, classes="decision-question", markup=False)
+                        yield Static("原因（报告自报）：" + presentation.why, id=f"decision-context-{index}", classes="decision-meta", markup=False)
+                        yield Static("本项责任与后续", id=f"decision-action-{index}", classes="decision-section-heading", markup=False)
+                        yield Static("本项责任（报告自报）：" + spec.owner, id=f"decision-owner-{index}", classes="decision-meta", markup=False)
+                        yield Static("你来回答 · " + plain[1] if plain else presentation.guidance,
+                                     id=f"decision-action-guide-{index}", classes="decision-meta", markup=False)
+                        if plain:
+                            yield Static("不是你补 · " + plain[2], id=f"decision-other-{index}", classes="decision-meta", markup=False)
                         if spec.key in self.waiting_keys:
                             yield Static("补证后没有新证据；请等待负责人材料。仍可明确再次提交反馈，不会自动派发。",
                                          id=f"decision-waiting-{index}", classes="decision-meta", markup=False)
+                        yield Static(f"待补材料 · {len(spec.missing)} 项" if spec.missing else
+                                     "无已列缺口；仍须核对依据。" if spec.evidence else "缺少可核对依据。",
+                                     id=f"decision-gaps-{index}", classes="decision-missing", markup=False)
+                        for group in presentation.provider_groups:
+                            with Vertical(classes="decision-provider-group"):
+                                yield Static("提供方（报告原称）：" + group.owner, classes="decision-meta", markup=False)
+                                for need in group.needs:
+                                    yield Static(f"{need.index}. {need.gap}", id=f"decision-gap-{index}-{need.index}", classes="decision-missing", markup=False)
+                                    with Collapsible(title=f"查看依据 · 第{need.index}项", collapsed=True, classes="decision-evidence"):
+                                        yield Static("来源引用（未打开、未核验）：" + (need.source or "原报告未逐项提供来源"),
+                                                     id=f"decision-need-source-{index}-{need.index}", markup=False)
+                        if not unresolved and spec.options:
+                            yield Static("方案对照 · 收益 / 代价 / 风险 / 范围（报告自报）", classes="decision-section-heading", markup=False)
+                            if len(spec.options) == 2:
+                                yield Static(_comparison_table(spec.options), id=f"comparison-wide-{index}", classes="decision-comparison decision-compare-wide")
+                            for number, option in enumerate(spec.options):
+                                yield Static(_comparison_table((option,), number + 1), id=f"comparison-compact-{index}-{number}",
+                                             classes="decision-comparison" + (" decision-compare-compact" if len(spec.options) == 2 else ""))
+                        yield Static("你的回应", classes="decision-section-heading", markup=False)
                         if unresolved and not self.business_inputs[index]:
+                            yield Button("请负责人补证本项", id=f"decision-owner-request-{index}", classes="decision-reply-jump", disabled=self.readonly)
+                        yield Button("回答业务问题 ↓" if self.business_inputs[index] else "其他意见 ↓",
+                                     id=f"decision-reply-{index}", classes="decision-reply-jump", disabled=self.readonly)
+                        yield Button("看不懂？请解释本项", id=f"decision-explain-{index}", classes="decision-explain", disabled=self.readonly)
+                        yield Static("", id=f"decision-reply-status-{index}", classes="decision-live", markup=False)
+                        with Collapsible(title="其他回应 · 答复类型与输入", collapsed=True,
+                                         id=f"decision-other-reply-{index}", classes="decision-details"):
                             yield from self.reply_controls(index, spec, initial)
-                        if unresolved:
-                            yield Button("看不懂？请解释本项", id=f"decision-explain-{index}", classes="decision-explain", disabled=self.readonly)
-                        if plain:
-                            yield Static("不是你补 · " + plain[2], id=f"decision-other-{index}", classes="decision-meta", markup=False)
                         yield Static("本项 · " + self.item_status(index) + "；这里只是填写，不会发送。", id=f"decision-live-{index}", classes="decision-live", markup=False)
-                        with (Collapsible(title="查看缺口、方案与原报告（Agent 自报）", collapsed=True, id=f"decision-details-{index}", classes="decision-details") if unresolved else nullcontext()):
-                            yield Static("具体缺什么 · 尚不可批准" if unresolved else "具体缺什么 · 未列缺口，仍需核对",
-                                         classes="decision-section-heading decision-warning" if unresolved else "decision-section-heading", markup=False)
-                            gap = "缺少可核对依据。" if not spec.evidence else "原上限及累计已用的结构化账本尚未提供。" if spec.kind == "budget" else "无已列缺口；仍须核对依据。"
-                            yield Static("\n".join(f"{number}. {missing}" for number, missing in enumerate(spec.missing, 1)) if spec.missing else gap,
-                                         id=f"decision-gaps-{index}", classes="decision-missing", markup=False)
-                            yield Static("谁负责（Agent 自报；缺口未逐项分配）· " + spec.owner, id=f"decision-owner-{index}", classes="decision-meta", markup=False)
-                            yield Static(("原报告问题（专业表述）· " + spec.question + "\n" if plain else "") +
-                                         "为什么要决定（Agent 自报）· " + spec.why, id=f"decision-context-{index}", classes="decision-meta", markup=False)
-                            if spec.options:
-                                yield Static("方案对照 · 收益 / 代价 / 风险 / 范围（Agent 自报）", classes="decision-section-heading", markup=False)
+                        selected = Static("", id=f"decision-selected-{index}", classes="decision-boundary", markup=False)
+                        selected.display = False
+                        yield selected
+                        yield Static("核对边界与建议 · 自报，非批准", classes="decision-section-heading", markup=False)
+                        yield Static(_boundary_text(spec), id=f"decision-boundary-{index}", classes="decision-boundary", markup=False)
+                        yield Static(_advice_text(spec), id=f"decision-recommendation-{index}", classes="decision-recommendation", markup=False)
+                        if spec.kind == "budget":
+                            yield Static("预算核对 · 建议不是批准", classes="decision-section-heading decision-warning", markup=False)
+                            yield Static("累计账本请在更多工具 / Ctrl+K 单独核对。正式预算批准入口未启用；业务答案、反馈与本地账本不替代派发许可。", classes="decision-meta", markup=False)
+                            b = spec.budget
+                            previous_budget = self.previous.get(spec.key)
+                            old = previous_budget[1].budget if previous_budget and previous_budget[1].kind == "budget" else None
+                            baseline = (f"{old.attempts} 次 / {old.minutes} 分钟 / {old.storage_mib} MiB（本地此前确认的总帽，非剩余额度）" if old else "未知（无可核对的结构化旧账本）")
+                            proposal = (f"{b.attempts} 次 / {b.minutes} 分钟 / {b.storage_mib} MiB" if b else "未提供")
+                            yield Static(f"原上限：{baseline}\n累计已用：未知（未提供结构化用量）\n建议新上限（未采纳）：{proposal}\n建议停止条件：" + ("；".join(b.stop_conditions) if b else "未提供"), id=f"budget-facts-{index}", classes="decision-budget", markup=False)
+                        with (Collapsible(title="查看方案、专业背景与历史（报告自报）", collapsed=True, id=f"decision-details-{index}", classes="decision-details") if unresolved else nullcontext()):
+                            yield Static("原报告问题（专业表述）：" + spec.question, markup=False, classes="decision-meta")
+                            if unresolved and spec.options:
+                                yield Static("方案对照 · 收益 / 代价 / 风险 / 范围（报告自报）", classes="decision-section-heading", markup=False)
                                 if len(spec.options) == 2:
                                     yield Static(_comparison_table(spec.options), id=f"comparison-wide-{index}", classes="decision-comparison decision-compare-wide")
                                 for number, option in enumerate(spec.options):
                                     yield Static(_comparison_table((option,), number + 1), id=f"comparison-compact-{index}-{number}",
                                                  classes="decision-comparison" + (" decision-compare-compact" if len(spec.options) == 2 else ""))
-                            if spec.kind == "budget":
-                                yield Static("预算核对 · 建议不是批准", classes="decision-section-heading decision-warning", markup=False)
-                                yield Static("累计账本请在更多工具 / Ctrl+K 单独核对。正式预算批准入口未启用；业务答案、反馈与本地账本不替代派发许可。", classes="decision-meta", markup=False)
-                                b = spec.budget
-                                previous_budget = self.previous.get(spec.key)
-                                old = previous_budget[1].budget if previous_budget and previous_budget[1].kind == "budget" else None
-                                baseline = (f"{old.attempts} 次 / {old.minutes} 分钟 / {old.storage_mib} MiB（本地此前确认的总帽，非剩余额度）" if old else "未知（无可核对的结构化旧账本）")
-                                proposal = (f"{b.attempts} 次 / {b.minutes} 分钟 / {b.storage_mib} MiB" if b else "未提供")
-                                yield Static(f"原上限：{baseline}\n累计已用：未知（未提供结构化用量）\n建议新上限（未采纳）：{proposal}\n建议停止条件：" + ("；".join(b.stop_conditions) if b else "未提供"), id=f"budget-facts-{index}", classes="decision-budget", markup=False)
-                            yield Static("推荐与边界 · Agent 自报，非默认选择", classes="decision-section-heading", markup=False)
-                            if spec.routing:
-                                route = spec.routing
-                                advice = route.advice
-                                note = (f"有据候选 · {advice.value} {advice.unit}；条件：{advice.conditions}\n"
-                                        + "依据：" + "；".join(advice.evidence)
-                                        + f"\n不确定性：{advice.uncertainty}；负责人签收：{'是' if advice.owner_signed else '否'}；非批准。"
-                                        if advice.status == "supported" else
-                                        "证据不足 · 暂不能推荐具体设置值；等 " + "；".join(
-                                            f"{need.owner}提供{need.source}（{need.gap}）" for need in route.evidence_needs))
-                            else:
-                                note = f"旧报告建议（未结构化核验）· {spec.recommendation}\n理由 · {spec.reason}；不作默认选择。"
-                            yield Static(note, id=f"decision-recommendation-{index}", classes="decision-recommendation", markup=False)
-                            yield Static("范围 · " + spec.scope + "\n不包括 · " + ("；".join(spec.exclusions) or "无额外排除，仍受原任务范围限制"), classes="decision-boundary", markup=False)
-                            with Collapsible(title=f"完整依据与背景 · {len(spec.evidence)} 条（Agent 自报）", collapsed=True, classes="decision-evidence"):
-                                yield Static(f"完整决策责任：{spec.owner}\n为什么：{spec.why}\n整体风险：{spec.risk}\n整体成本：{spec.cost}\n依据：\n" + ("\n".join(f"{number}. {evidence}" for number, evidence in enumerate(spec.evidence, 1)) if spec.evidence else "未提供，不可批准"), markup=False)
+                            with Collapsible(title=f"完整依据与背景 · {len(spec.evidence)} 条（报告自报）", collapsed=True, classes="decision-evidence"):
+                                yield Static(f"完整决策责任：{spec.owner}\n为什么：{spec.why}\n依据：\n" + ("\n".join(f"{number}. {evidence}" for number, evidence in enumerate(spec.evidence, 1)) if spec.evidence else "未提供，不可批准"), markup=False)
+                                if spec.routing:
+                                    yield Static("建议依据：\n" + "\n".join(spec.routing.advice.evidence), markup=False)
                             previous = self.previous.get(spec.key)
                             if previous:
                                 record, answer = previous
@@ -601,9 +690,9 @@ class DecisionSheet(ModalScreen):
                                              "仅本地保存，未发送；如需发送本次答复，请重新核对目标与后果。") if record.intent.kind == "saved" else
                                             "已提交意图；是否收到或完成仍需核实。")
                                 yield Static(f"{title} · {record.confirmed_at}\n{answer_text(spec, answer, self.business_inputs[index])}\n{note}\n{delivery}", id=f"decision-previous-{index}", classes="decision-previous", markup=False)
-                        if not unresolved:
-                            yield from self.reply_controls(index, spec, initial)
-                            yield Button("看不懂？请解释本项", id=f"decision-explain-{index}", classes="decision-explain", disabled=self.readonly)
+                with Collapsible(title="完整原报告（来源快照）", collapsed=True, id="decision-report-source", classes="decision-details"):
+                    yield Static(_report_text(self.report_view), id="decision-original-report", markup=False)
+                    yield TextArea(self.report_view.source_bytes, read_only=True, id="decision-report-envelope", classes="decision-envelope")
             yield Static("保存≠发送；补证需再确认；材料齐后再决定，不自动执行。" if self.needs_evidence else
                          "保存≠发送；正式选择仍需确认，不自动执行。", id="decision-flow", classes="decision-meta", markup=False)
             with Grid(classes="decision-controls"):
@@ -617,6 +706,8 @@ class DecisionSheet(ModalScreen):
         overview.highlighted = self.selected_index
         overview.focus()  # Keep arrows on the question list, including home-row entry.
         for index in range(len(self.specs)):
+            if self.intents[index]:
+                self.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed = False
             self.update_live_status(index)
         self.sync_continue()
         self._initial_edit_values = self.edit_values()
@@ -663,6 +754,8 @@ class DecisionSheet(ModalScreen):
                     error.display = conditional and not bool(widget.value.strip())
                     error.update("请写明条件；不填不能提交。" if error.display else "")
                     error.can_focus = bool(error.display)
+                    if error.display:
+                        self.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed = False
             value = self.query_one(f"#answer-{index}", Select).value
             if intent != "feedback" or value != "request_info":
                 self.owner_requests.discard(index)
@@ -672,6 +765,24 @@ class DecisionSheet(ModalScreen):
                           ("超出上限；完整原文保留，请精简后再核对。" if len(comment) > 500 else "可多行，不扩展授权。"))
             length.can_focus = len(comment) > 500
             length.set_class(len(comment) > 500, "error")
+            if intent and len(comment) > 500:
+                self.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed = False
+            selected_option = next((option for option in self.specs[index].options
+                                    if intent in {"feedback", "formal"} and value in {"choice:" + option.key, "preference:" + option.key}), None)
+            selected_view = self.query_one(f"#decision-selected-{index}", Static)
+            selected_view.display = selected_option is not None
+            if selected_option:
+                selected_view.update(f"本次方案（尚未确认）：{selected_option.label}\n方案范围：{selected_option.scope}"
+                                     f"\n方案风险：{selected_option.risk}\n方案代价：{selected_option.cost}")
+            try:
+                answer = self.answers()[index]
+                participation = (("本项已开始填写；" if intent else "") + "无新增答复，本项不发送" if answer == Answer() else
+                                 "本项已选择，将列入最后核对，尚未发送")
+            except ValueError:
+                participation = "答复待校验，不会提交"
+            intent_label = {"": "未选择", "fact": "业务事实（非授权）", "feedback": "反馈（非授权）",
+                            "formal": "正式决定待核对", "wait": "等待材料"}.get(str(intent), "待校验")
+            self.query_one(f"#decision-reply-status-{index}", Static).update(intent_label + " · " + participation)
             status = {"": self.item_status(index) + " · 未选，本次不发送", "fact": "未确认 · 已答业务问题（非授权）",
                       "feedback": "未确认 · 反馈（非授权）", "formal": "未确认 · 方案待确认",
                       "wait": "等待材料 · 不重复发送"}.get(str(intent), "待核对")
@@ -778,6 +889,64 @@ class DecisionSheet(ModalScreen):
             event.option_list.focus()
             event.stop()
 
+    def reveal_reply(self, index: int, target_id: str) -> None:
+        if (not self.is_mounted or not self.is_running or self.app.screen is not self or self.busy
+                or self.readonly or index != self.selected_index or not 0 <= index < len(self.specs)):
+            return
+        self.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed = False
+        self.update_live_status(index)
+
+        def focus_reply() -> None:
+            if (not self.is_running or self.app.screen is not self or self.busy or self.readonly
+                    or index != self.selected_index):
+                return
+            reply = self.query_one("#" + target_id)
+            if (reply.disabled or not reply.is_mounted or
+                    any(not ancestor.display for ancestor in reply.ancestors_with_self if hasattr(ancestor, "display")) or
+                    self.query_one(f"#decision-other-reply-{index}", Collapsible).collapsed):
+                return
+            reply.scroll_visible(top=True, animate=False, immediate=True)
+            reply.focus(scroll_visible=False)
+
+        async def settle_reply() -> None:
+            # Drain the ancestor's expansion watcher and the input's visibility queue;
+            # otherwise Collapsible's later title scroll can hide a focused input.
+            await self.query_one(f"#decision-other-reply-{index}", Collapsible).wait_for_refresh()
+            if not self.is_running or self.app.screen is not self or self.busy or index != self.selected_index:
+                return
+            await self.query_one("#" + target_id).wait_for_refresh()
+            self.call_after_refresh(focus_reply)
+        self.run_worker(settle_reply())
+
+    def on_collapsible_collapsed(self, event: Collapsible.Collapsed) -> None:
+        container = event.collapsible
+        if (not self.is_mounted or not self.is_running or self.app.screen is not self
+                or not (container.id or "").startswith("decision-other-reply-")):
+            return
+        for index in range(len(self.specs)):
+            if container.id != f"decision-other-reply-{index}":
+                continue
+            intent = self.query_one(f"#intent-{index}", Select).value
+            question = self.business_inputs[index]
+            missing_condition = bool(question and question.kind == "choice" and intent == "fact"
+                                     and self.query_one(f"#business-choice-{index}", Select).value == "conditional"
+                                     and not self.query_one(f"#business-detail-{index}", Input).value.strip())
+            if missing_condition or intent and len(self.query_one(f"#comment-{index}", TextArea).text) > 500:
+                # A known inline field error must remain reachable, including Ctrl+Enter.
+                # Visibility changes only; no intent, answer or provider-request mutation.
+                container.collapsed = False
+            break
+
+        def restore_visible_focus() -> None:
+            if not self.is_running or self.app.screen is not self or not container.collapsed:
+                return
+            focused = self.focused
+            overview = self.query_one("#decision-overview", OptionList)
+            if (focused is not None and focused.parent is not container
+                    and container in focused.ancestors_with_self and not overview.disabled):
+                overview.focus()
+        self.call_after_refresh(restore_visible_focus)
+
     def on_resize(self) -> None:
         self.set_class(self.size.width < 64, "decision-narrow")
         self.set_class(self.size.height >= 32, "decision-spaced")
@@ -819,6 +988,8 @@ class DecisionSheet(ModalScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
+        if not self.is_running or self.app.screen is not self:
+            return
         if event.button.id == "decision-close":
             self.action_back()
         elif (event.button.id or "").startswith("decision-owner-request-") and not self.busy and not self.readonly:
@@ -828,7 +999,7 @@ class DecisionSheet(ModalScreen):
                     self.change_intent(index)
                     self.query_one(f"#answer-{index}", Select).value = "request_info"
                     self.owner_requests.add(index)
-                    self.update_live_status(index)
+                    self.reveal_reply(index, f"answer-{index}")
                     break
         elif (event.button.id or "").startswith("decision-reply-") and not self.busy and not self.readonly:
             for index in range(len(self.specs)):
@@ -836,13 +1007,9 @@ class DecisionSheet(ModalScreen):
                     question = self.business_inputs[index]
                     self.query_one(f"#intent-{index}", Select).value = "fact" if question else "feedback"
                     self.change_intent(index)
-                    reply = (self.query_one(f"#business-choice-{index}", Select) if question and question.kind == "choice" else
-                             self.query_one(f"#business-text-{index}", Input) if question else
-                             self.query_one(f"#answer-{index}", Select))
-                    def focus_reply(reply=reply) -> None:
-                        reply.scroll_visible(top=True, animate=False)
-                        reply.focus()
-                    self.call_after_refresh(focus_reply)
+                    target = (f"business-choice-{index}" if question and question.kind == "choice" else
+                              f"business-text-{index}" if question else f"answer-{index}")
+                    self.reveal_reply(index, target)
                     break
         elif (event.button.id or "").startswith("decision-explain-") and not self.busy and not self.readonly:
             for index in range(len(self.specs)):
@@ -851,7 +1018,7 @@ class DecisionSheet(ModalScreen):
                     self.query_one(f"#intent-{index}", Select).value = "feedback"
                     self.change_intent(index)
                     self.query_one(f"#answer-{index}", Select).value = "request_info"
-                    self.update_live_status(index)
+                    self.reveal_reply(index, f"answer-{index}")
                     break
         elif (event.button.id or "").startswith("decision-recommend-") and not self.busy and not self.readonly:
             for index in range(len(self.specs)):
@@ -866,7 +1033,7 @@ class DecisionSheet(ModalScreen):
                         self.query_one("#decision-error", Static).update("反馈超过 500 字，请先精简，已有文字未改动。")
                     else:
                         widget.text = value
-                        widget.focus()
+                        self.reveal_reply(index, f"comment-{index}")
                     break
         elif (event.button.id or "").startswith("decision-feedback-") and not self.busy and not self.readonly:
             for index in range(len(self.specs)):
@@ -877,6 +1044,8 @@ class DecisionSheet(ModalScreen):
                         self.query_one("#decision-error", Static).update("请先写本项反馈，或点击‘请给有依据的建议’。")
                     break
         elif event.button.id in {"decision-draft", "decision-saved", "decision-continue"}:
+            for index in range(len(self.specs)):
+                self.update_live_status(index)
             self.request((event.button.id or "").removeprefix("decision-"))
 
     def action_saved(self) -> None:

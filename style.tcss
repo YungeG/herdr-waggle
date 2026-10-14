@@ -192,7 +192,7 @@ DiscardChanges, DecisionSheet, DecisionReview { align: center middle; background
 .decision-inactive { display: none; }
 .decision-item { height: auto; padding: 0; margin: 0; }
 .decision-item Static { height: auto; margin: 0; }
-.decision-section-heading { height: 1; background: #2b455e; color: #eff7fc; text-style: bold; padding: 0 1; }
+.decision-section-heading { height: auto; min-height: 1; background: #2b455e; color: #eff7fc; text-style: bold; padding: 0 1; }
 .decision-section-heading.decision-warning { background: #55402f; color: #ffe5be; }
 .decision-spaced .decision-section-heading { margin-top: 1; }
 .decision-spaced .decision-section-heading.decision-first { margin-top: 0; }
@@ -201,8 +201,6 @@ DiscardChanges, DecisionSheet, DecisionReview { align: center middle; background
 .decision-missing { color: #ffd49d; padding: 0 1; }
 .decision-reply-jump { width: auto; height: 1; min-width: 0; border: none; background: #31536c; color: #f3f9ff; }
 .decision-explain { width: auto; height: 1; min-width: 0; border: none; background: #243247; color: #c8d9e9; }
-.decision-business-jump { display: none; }
-.decision-narrow .decision-business-jump { display: block; }
 .decision-inline-error { display: none; color: #ffb8a8; padding: 0 1; }
 .decision-solution { border: none; padding: 0; margin: 0; background: #182c40; }
 .decision-solution > CollapsibleTitle { height: 1; padding: 0 1; color: #b6d6ec; }
@@ -215,9 +213,12 @@ DiscardChanges, DecisionSheet, DecisionReview { align: center middle; background
 .decision-recommendation { color: #dceaf4; padding: 0 1; }
 .decision-boundary { color: #afc2d5; padding: 0 1; }
 .decision-details { border: none; background: #182c40; padding: 0; margin: 0; }
-.decision-details > CollapsibleTitle { height: 1; color: #ffd49d; padding: 0 1; }
+.decision-details > CollapsibleTitle { height: auto; min-height: 1; color: #ffd49d; padding: 0 1; }
+.decision-details > Contents { padding: 0 1; }
+.decision-provider-group { height: auto; padding: 0 1; }
+#decision-global-handoff { height: auto; margin-bottom: 1; }
 .decision-evidence { border: none; background: transparent; padding: 0; margin: 0; }
-.decision-evidence > CollapsibleTitle { height: 1; padding: 0 1; color: #a9c9d8; }
+.decision-evidence > CollapsibleTitle { height: auto; min-height: 1; padding: 0 1; color: #a9c9d8; }
 .decision-evidence > Contents { padding: 0 1; }
 .decision-previous { color: #90d4ad; }
 .decision-item Input, .decision-item Select { height: 3; margin: 0; }
@@ -229,14 +230,14 @@ DiscardChanges, DecisionSheet, DecisionReview { align: center middle; background
 .decision-controls Button { height: 1; width: 1fr; min-width: 8; padding: 0; border: none; text-wrap: nowrap; text-overflow: ellipsis; }
 .decision-narrow .decision-controls { height: 2; grid-size: 2; grid-columns: 1fr 1fr; }
 .decision-narrow .decision-dialog { padding: 0 1; }
-.decision-narrow .decision-first, .decision-narrow .decision-live { display: none; }
 .decision-narrow #decision-overview { height: 1; min-height: 1; max-height: 1; }
 .decision-narrow .dialog-title { height: 1; margin-bottom: 0; text-wrap: nowrap; text-overflow: ellipsis; }
 DiscardChanges .decision-controls, DecisionReview .decision-controls { grid-size: 2; grid-columns: 1fr 1fr; }
 DecisionReview.decision-review-narrow .decision-controls { height: 2; grid-size: 1; grid-columns: 1fr; }
 #discard-changes { width: 70; height: 13; max-height: 96%; }
 #discard-message { height: 1fr; min-height: 2; }
-#decision-preview-text { height: auto; min-height: 6; max-height: 25; }
+#decision-preview-text { height: auto; }
+.decision-envelope { height: 12; max-height: 25; }
 #decision-error { height: auto; max-height: 3; overflow-y: auto; }
 #decision-status { height: auto; color: #f1b778; padding: 0 1; }
 #decision-items { height: auto; border: none; padding: 0; margin: 0; background: transparent; }

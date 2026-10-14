@@ -1,6 +1,6 @@
 """Pure tasks, execution state and immutable human decision records. No I/O."""
 from copy import copy
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from uuid import UUID, uuid4
 
 from budget_ledger import (
@@ -51,11 +51,23 @@ from journal import (
     readable_event,
     validate_events,
 )
+from session_adoption import (
+    ATTACHED_KIND,
+    REJECTED_KIND,
+    REQUEST_KIND,
+    AdoptionIntent,
+    AdoptionReceipt,
+    AdoptionRequest,
+    adoption_confirmed,
+    latest_adoption,
+    run_digest,
+)
 from steps import MAX_STEPS, Step, step_time, validate_plan
 from task_context import (
     DEPENDENCY_MARKER,
     TaskContext,
     WorkContract,
+    canonical,
     check_followup_input,
     context_export,
     has_valid_contract,
@@ -123,6 +135,32 @@ class Run:
     def continuation_parent(self) -> str:
         return next((event.text for event in validate_events(self.events, run_id=self.id, seq=self.seq)
                      if event.kind == "continued"), "")
+
+    @property
+    def adoption_origin(self) -> dict[str, str]:
+        import json
+        event = next((item for item in validate_events(self.events, run_id=self.id, seq=self.seq)
+                      if item.kind == "adopted"), None)
+        return json.loads(event.text) if event else {}
+
+    @property
+    def adoption_id(self) -> str:
+        return self.adoption_origin.get("adoption_id", "")
+
+    @property
+    def adoption_parent(self) -> str:
+        return self.adoption_origin.get("parent_run_id", "")
+
+    @property
+    def adoption_source_digest(self) -> str:
+        return self.adoption_origin.get("source_digest", "")
+
+    def check_adoption_parent(self, parent: "Run") -> None:
+        if (not parent.terminal or self.adoption_parent != parent.id or self.id == parent.id
+                or (self.task_id, self.session_id, self.cwd, self.title, self.description)
+                != (parent.task_id, parent.session_id, parent.cwd, parent.title, parent.description)
+                or self.adoption_source_digest != run_digest(parent)):
+            raise ValueError("纳管只能接续同一会话和目标，原终态轮次不可改写。")
 
     def check_continuation(self, parent: "Run") -> None:
         base = carried_requirements(parent.requirements, parent.remaining)
@@ -300,11 +338,14 @@ class Board:
 
     def lineage(self, run: Run) -> list[Run]:
         result, seen = [run], {run.id}
-        while parent_id := result[-1].continuation_parent:
+        while parent_id := result[-1].continuation_parent or result[-1].adoption_parent:
             parent = self.runs.get(parent_id)
             if parent is None or parent.id in seen:
                 raise ValueError("续接历史缺少父轮次或包含循环。")
-            result[-1].check_continuation(parent)
+            if result[-1].adoption_parent:
+                result[-1].check_adoption_parent(parent)
+            else:
+                result[-1].check_continuation(parent)
             result.append(parent)
             seen.add(parent.id)
         return result
@@ -653,7 +694,9 @@ class Board:
             raise ValueError('Pi 必须在所选项目的精确目录中。')
         if not valid_uuid(run_id) or not valid_uuid(session_id):
             raise ValueError('执行身份无效。')
-        if run_id in self.runs or any(not run.terminal and (run.agent_id == agent_id or run.task_id == task.id) for run in self.runs.values()):
+        if run_id in self.runs or any(not run.terminal and (run.agent_id == agent_id or run.task_id == task.id
+                                                           or (run.session_id, run.cwd) == (session_id, cwd))
+                                      for run in self.runs.values()):
             raise ValueError('任务或 Pi 仍有未确认结束的执行，不能重派。')
         from decisions import request_only_decisions
         purpose = 'evidence' if decision is not None and request_only_decisions(decision.specs, decision.answers) else operation(requirements)
@@ -701,6 +744,66 @@ class Board:
         task.remaining, task.run, task.status = text, 'none', 'ready' if task.agent else 'draft'
         task.full_delivery, task.blocker = False, ''
         task.summary, task.checks = '恢复请求仅本地保存；旧轮错误和进度仍在历史记录。', []
+
+    def request_adoption(self, task: Task, intent: AdoptionIntent) -> None:
+        """Persist explicit attachment consent before publication; never create a Run."""
+        self._require_active(task)
+        intent = AdoptionIntent.from_record(intent.record())
+        intent.validate_task(self, task)
+        source_id = intent.source.run_id if intent.source else ""
+        if task.run_id != source_id or any(not run.terminal and (run.task_id == task.id
+                or (run.session_id, run.cwd) == (intent.session_id, intent.cwd)) for run in self.runs.values()):
+            raise ValueError("原轮次或同一会话仍有未确认结束的执行；不能重复纳管。")
+        previous = latest_adoption(task)
+        if previous == intent:
+            return
+        if previous and not adoption_confirmed(task, previous) and not any(
+                event and event.kind == REJECTED_KIND and event.text == previous.id
+                for raw in task.events if (event := readable_event(raw)) is not None):
+            raise ValueError("已有纳管接收尚未确认；只核对原意图，不生成新 ID 重试。")
+        self.note(task, REQUEST_KIND, canonical(intent.record()), run_id=source_id)
+
+    def apply_adoption(self, intent: AdoptionIntent, receipt: AdoptionReceipt) -> bool:
+        receipt = AdoptionReceipt.from_record({"version": 1, **asdict(receipt)}, intent)
+        task = self.tasks[intent.task_id]
+        intent.validate_task(self, task)
+        if latest_adoption(task) != intent:
+            raise ValueError("纳管意图已变化；不能接管迟到回执。")
+        if receipt.state == "waiting":
+            return False
+        kind = ATTACHED_KIND if receipt.state in {"attached", "consumed"} else REJECTED_KIND
+        if any(event and event.kind == kind and event.text == intent.id
+               for raw in task.events if (event := readable_event(raw)) is not None):
+            return False
+        source_id = intent.source.run_id if intent.source else ""
+        if task.run_id != source_id:
+            raise ValueError("任务已开始另一轮；旧纳管回执不改变当前任务。")
+        self.note(task, kind, intent.id, run_id=source_id, source="system")
+        if kind == ATTACHED_KIND:
+            task.agent = intent.agent_id
+            if task.status == "draft":
+                task.status = "ready"
+        return True
+
+    def ingest_adopted(self, request: AdoptionRequest, incoming: Run) -> bool:
+        """Receive only the first explicitly attached native input, not past conversation."""
+        incoming = Run.from_record(asdict(incoming))
+        request.validate_run(incoming)
+        intent = request.intent
+        task = self.tasks[intent.task_id]
+        intent.validate_task(self, task)
+        if latest_adoption(task) != intent or not adoption_confirmed(task, intent):
+            raise ValueError("没有本任务已确认的会话关联；不接管原生输入。")
+        if incoming.id in self.runs:
+            return self.ingest(incoming)
+        if (task.run_id != (intent.source.run_id if intent.source else "")
+                or any(run.adoption_id == intent.id or (not run.terminal and
+                       (run.task_id == task.id or (run.session_id, run.cwd) == (intent.session_id, intent.cwd)))
+                       for run in self.runs.values())):
+            raise ValueError("纳管已有消费或其他执行；不接管分叉。")
+        self.runs[incoming.id] = replace(incoming, state="queued", seq=0, delivery="", summary="", checks=[], remaining="", events=[])
+        task.run_id, task.run, task.full_delivery = incoming.id, "queued", False
+        return self.ingest(incoming)
 
     def set_work_contract(self, task: Task, contract: WorkContract) -> None:
         from failure_view import RECOVERY_END, RECOVERY_MARKER, split_recovery

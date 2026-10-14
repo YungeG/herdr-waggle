@@ -234,6 +234,8 @@ def decode(data: str, *, legacy: bool = False, version: int = SCHEMA_VERSION) ->
                         raise StorageError('累计账本审计身份重复。')
                     registry[record.id] = record
         check_budget_structure(board)
+        from session_adoption import validate_adoptions
+        validate_adoptions(board)
         from task_context import check_contexts
         check_contexts(board)
         check_evidence(board)
@@ -242,7 +244,7 @@ def decode(data: str, *, legacy: bool = False, version: int = SCHEMA_VERSION) ->
         active_tasks: set[int] = set()
         continued_parents: set[str] = set()
         for run in board.runs.values():
-            if parent_id := run.continuation_parent:
+            if parent_id := run.continuation_parent or run.adoption_parent:
                 if parent_id in continued_parents:
                     raise StorageError("执行续接出现分叉。")
                 continued_parents.add(parent_id)
@@ -383,6 +385,8 @@ class Store:
                             raise StorageError('保留报告的原始字节不能同 ID 重写或重新编码。')
                 for task_id, old_task in previous.tasks.items():
                     task = board.tasks.get(task_id)
+                    if task:
+                        check_history(old_task.events, task.events)
                     if task and old_task.status == 'done':
                         if task.status != 'done':
                             raise StorageError('已验收任务不可降级以改写原始范围；新工作请创建后续草稿。')

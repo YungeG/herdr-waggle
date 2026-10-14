@@ -35,7 +35,7 @@ from task_actions import decision_items
 from task_context import WorkContract
 from test_capabilities import capability_record
 from test_continuations import session_record
-from test_decisions import spec_record
+from test_decisions import routing_payload, spec_record
 from test_live import wait_ui
 from test_observation import files
 
@@ -161,6 +161,7 @@ class WorkbenchTests(unittest.IsolatedAsyncioTestCase):
                 state_before = self.bind_idle_owner()
                 app = Waggle(store=self.store, runtime=self.runtime)
                 async with app.run_test(size=(width, height)) as pilot:
+                    await wait_ui(pilot, lambda app=app: app.primary_action().label == '索取可审提案 b')
                     if width < 100:
                         self.assertIn("索取可审提案", self.frame(app))
                         await pilot.press("right")
@@ -425,6 +426,42 @@ class WorkbenchTests(unittest.IsolatedAsyncioTestCase):
         self.bind_idle_owner()
         return encode(board)
 
+    async def test_home_uses_audience_questions_states_and_gap_counts_not_full_gap_paragraphs(self):
+        gap = '完整原件未核对；不得由展示推断已经完成。' * 6
+        owner_route = routing_payload(gap=gap)
+        specs = (
+            DecisionSpec.from_record(spec_record(key='materials', question='合成材料有哪些缺口？', missing=[gap], routing=owner_route)),
+            DecisionSpec.from_record(spec_record(key='fact', question='技术问题不应当作业务问题',
+                human_input={'kind': 'choice', 'question': '业务问题：是否必须提前？', 'options': [
+                    {'key': 'yes', 'label': '需要'}, {'key': 'no', 'label': '不需要'}]},
+                missing=['原始回执缺失'], routing=routing_payload('user_fact'))),
+            DecisionSpec.from_record(spec_record(key='choice', question='核对合成方案的边界？',
+                routing=routing_payload('user_decision', gap='', status='supported'))),
+        )
+        self.new_terminal_report(specs=specs)
+        before = encode(self.store.load())
+        for size in ((80, 24), (130, 50)):
+            with self.subTest(size=size):
+                app = Waggle(store=self.store)
+                async with app.run_test(size=size) as pilot:
+                    if size[0] < 100:
+                        await pilot.press('right')
+                    await pilot.pause()
+                    items = app.query_one('#decision-items', OptionList)
+                    prompts = [str(items.get_option_at_index(i).prompt) for i in range(3)]
+                    for prompt, category, question, count in zip(prompts,
+                            ('待补材料', '待答问题', '待核对方案'),
+                            ('合成材料有哪些缺口？', '业务问题：是否必须提前？', '核对合成方案的边界？'), (1, 1, 0), strict=True):
+                        self.assertIn(category, prompt)
+                        self.assertIn(question, prompt)
+                        self.assertIn(f'缺口 {count} 项', prompt)
+                        self.assertIn('进入本项', prompt)
+                    self.assertNotIn(gap, '\n'.join(prompts))
+                    self.assertNotIn('技术问题不应当作业务问题', prompts[1])
+                    self.assertNotIn('建议（非默认）', prompts[2])
+                    self.assertEqual(encode(app.board), before)
+                    self.assertEqual(encode(self.store.load()), before)
+
     async def test_home_agenda_opens_exact_question_without_selecting_or_saving(self):
         before = self.with_decisions()
         for size in ((80, 24), (180, 40)):
@@ -444,7 +481,8 @@ class WorkbenchTests(unittest.IsolatedAsyncioTestCase):
                     items = app.query_one("#decision-items", OptionList)
                     self.assertEqual(items.option_count, 3)
                     self.assertIn("选择实施路线", self.frame(app))
-                    self.assertIn("缺少独立验证", str(items.get_option_at_index(2).prompt))
+                    self.assertIn("缺口 1 项", str(items.get_option_at_index(2).prompt))
+                    self.assertNotIn("缺少独立验证", str(items.get_option_at_index(2).prompt))
                     first = items.get_option_at_index(0)
                     app.show_detail()
                     self.assertIs(items.get_option_at_index(0), first, "unchanged refresh must not rebuild focus/scroll")
@@ -538,7 +576,7 @@ class WorkbenchTests(unittest.IsolatedAsyncioTestCase):
             menu = app.screen
             assert isinstance(menu, Choice)
             self.assertEqual(set(menu.options), {"activity", "toggle_detail", "steps", "evidence",
-                                                 "dependencies", "budget", "prepare_recovery"})
+                                                 "dependencies", "budget", "prepare_recovery", "adopt_session"})
             await pilot.press("escape")
             self.assertEqual(len(app.screen_stack), 1)
             self.assertTrue(await pilot.click("#more-button"))

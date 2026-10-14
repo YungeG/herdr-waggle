@@ -69,10 +69,14 @@ class OwnershipView:
 
 
 def project_ownership(task: 'Task', run: 'Run', agent: 'Agent | None', session: 'SessionObservation | None',
-                      *, now_ms: int | None = None, issue: str = '', readonly: bool = False) -> OwnershipView:
+                      *, now_ms: int | None = None, issue: str = '', readonly: bool = False,
+                      current_identity: tuple[str, str, str] | None = None) -> OwnershipView:
     from runtime import HEARTBEAT_SECONDS
     now = int(time.time() * 1000) if now_ms is None else now_ms
-    exact = (run.agent_id, run.session_id, run.cwd)
+    original = (run.agent_id, run.session_id, run.cwd)
+    exact = current_identity or original
+    if exact[1:] != original[1:] or readonly:
+        exact = original  # An attachment is not cross-session transfer or a read-only upgrade.
     actions = ('view',)
     if run.terminal and task.status != 'done' and task.retention == 'active':
         actions += ('prepare_recovery',)

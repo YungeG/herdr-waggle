@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="700" viewBox="0 0 1060 700" role="img" aria-labelledby="title description">
+  <title id="title">Waggle 三点信息层级 · 静态设计示意</title>
+  <desc id="description">用任务标题与状态识别任务，用高对比结论突出最近进展，用独立区域明确下一步。示例标题与内容不是实时任务数据，不会执行操作。</desc>
+  <style>
+    text { font-family: "Noto Sans Mono CJK SC", "Noto Sans CJK SC", "WenQuanYi Micro Hei", monospace; font-size: 22px; fill: #dbe6f3; }
+    .muted { fill: #91a2b8; }
+    .bright { fill: #eef6ff; font-weight: 700; }
+    .accent { fill: #79ccee; font-weight: 700; }
+  </style>
+  <rect width="1060" height="700" fill="#0d1420"/>
+  <text x="48" y="42" class="accent">WAGGLE</text>
+  <text x="1012" y="42" text-anchor="end" class="muted">任务详情 · 设计示意</text>
+  <rect x="32" y="66" width="996" height="572" fill="#121d2c" stroke="#2b3d52"/>
+
+  <!-- 1. Identification: task and status share one line; project is secondary. -->
+  <text x="62" y="114" class="muted">任务</text>
+  <text x="62" y="156" class="muted">D007</text>
+  <text x="144" y="156" class="bright">图形草稿板协作闭环</text>
+  <rect x="837" y="124" width="160" height="46" fill="#203b50"/>
+  <circle cx="859" cy="147" r="5" fill="#79ccee"/>
+  <text x="880" y="156" class="accent">执行中</text>
+  <text x="62" y="192" class="muted">herdr-sketch</text>
+  <path d="M62 219 H997" stroke="#304155"/>
+
+  <!-- 2. Outcome dominates; source/time and supporting facts have less contrast. -->
+  <text x="62" y="260" class="muted">最近进展</text>
+  <text x="997" y="260" text-anchor="end" class="muted">10:17 · 执行者自报</text>
+  <rect x="62" y="282" width="250" height="46" fill="#79ccee"/>
+  <text x="82" y="313" style="fill:#101b29;font-weight:700">原方案已找回</text>
+  <text x="62" y="365" class="muted">首版范围与工具版本已核对。</text>
+
+  <!-- 3. One action zone. It becomes amber only when the human needs to act. -->
+  <rect x="62" y="400" width="935" height="148" fill="#182c3b"/>
+  <rect x="62" y="400" width="5" height="148" fill="#79ccee"/>
+  <text x="88" y="436" class="accent">下一步 · Agent</text>
+  <text x="88" y="481" class="bright">审查固定基线，推进首个协作闭环</text>
+  <text x="88" y="520" class="muted">图编辑 → 对象提问 → 答案回挂</text>
+
+  <!-- Static affordances only, not live buttons. -->
+  <rect x="62" y="578" width="212" height="42" fill="#28384b"/>
+  <text x="168" y="607" text-anchor="middle" class="bright">查看完整报告</text>
+  <rect x="294" y="578" width="182" height="42" fill="none" stroke="#42566d"/>
+  <text x="385" y="607" text-anchor="middle">补充说明 b</text>
+  <text x="48" y="677" class="muted">静态设计示意 · 建议文案，非实时状态 · 不执行任何操作</text>
+</svg>

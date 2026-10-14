@@ -10,7 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from textual.containers import VerticalScroll
-from textual.widgets import Button, Select, SelectionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Select, SelectionList, Static, TextArea
 
 from app import Confirm, DispatchNote, Waggle
 from decision_view import DecisionReview, DecisionSheet, DiscardChanges
@@ -143,6 +143,220 @@ class IntentUI(unittest.IsolatedAsyncioTestCase):
     async def confirm(self, app, pilot):
         await pilot.click('#decision-confirm')
         await wait_ui(pilot, lambda: len(app.screen_stack) == 1)
+
+    async def test_reply_folding_preserves_answers_and_visible_status_with_real_keyboard_and_mouse(self):
+        for size in ((40, 18), (80, 24)):
+            with self.subTest(size=size):
+                app = self.app()
+                before = encode(self.store.load())
+                async with app.run_test(size=size) as pilot:
+                    form = await self.sheet(app, pilot)
+                    container = form.query_one('#decision-other-reply-0', Collapsible)
+                    title = container.query_one('CollapsibleTitle')
+                    self.assertTrue(container.collapsed)
+                    original = form.report_view
+                    title.scroll_visible(top=True, animate=False)
+                    title.focus()
+                    await pilot.pause()
+                    await pilot.press('enter')
+                    await pilot.pause()
+                    self.assertFalse(container.collapsed)
+                    self.assertEqual(form.answers(), (Answer(),))
+                    self.assertIs(form.focused, title, 'Ordinary expansion must not preselect or focus a reply')
+                    form.query_one('#intent-0', Select).value = 'feedback'
+                    form.query_one('#comment-0', TextArea).text = '仅本次追问，不扩大授权'
+                    await pilot.pause()
+                    answers, controls = form.answers(), form.edit_values()
+                    preview = preview_decisions(app.board, self.task.id, answers, Target('saved'))
+                    title.scroll_visible(top=True, animate=False)
+                    title.focus()
+                    await pilot.pause()
+                    await pilot.press('enter')
+                    await pilot.pause()
+                    self.assertTrue(container.collapsed)
+                    self.assertIs(form.focused, title, 'Collapsing from the title keeps its visible focus')
+                    status = form.query_one('#decision-reply-status-0', Static)
+                    status.scroll_visible(top=True, animate=False)
+                    await pilot.pause()
+                    self.assertTrue(form.query_one('#decision-body', VerticalScroll).content_region.contains_region(status.region))
+                    paint = form._compositor.render_strips()
+                    frame = ''.join(''.join(row.crop(status.region.x, status.region.right).text.split())
+                                    for row in paint[status.region.y:status.region.bottom])
+                    self.assertIn('将列入最后核对，尚未发送', frame)
+                    self.assertEqual(form.answers(), answers)
+                    self.assertEqual(form.edit_values(), controls)
+                    self.assertEqual(preview_decisions(app.board, self.task.id, form.answers(), Target('saved')), preview)
+                    title.scroll_visible(top=True, animate=False)
+                    await pilot.pause()
+                    self.assertTrue(await pilot.click(title))
+                    await pilot.pause()
+                    self.assertFalse(container.collapsed)
+                    comment = form.query_one('#comment-0', TextArea)
+                    comment.scroll_visible(top=True, animate=False)
+                    comment.focus()
+                    await pilot.pause()
+                    container.collapsed = True  # State change with focus still inside, not a title-key event.
+                    await pilot.pause()
+                    self.assertEqual(form.focused.id, 'decision-overview')
+                    self.assertEqual(form.answers(), answers)
+                    self.assertEqual(form.report_view, original)
+                    await pilot.resize_terminal(130, 40)
+                    await pilot.pause()
+                    self.assertTrue(container.collapsed)
+                    self.assertEqual(form.edit_values(), controls)
+                    self.assertEqual(encode(self.store.load()), before)
+                    self.assertFalse(list(self.endpoint.glob('commands/*.json')))
+
+    async def test_collapsed_reply_survives_review_back_item_switch_and_resize(self):
+        specs = (fact_spec(), fact_spec(key='second', question='第二个独立技术问题'))
+        run = self.source_run
+        run.events = [encoded_event('partial', '隔离双项焦点样例', source='executor', run_id=run.id, seq=1,
+            report=Report(run.summary, run.checks, run.remaining, decisions=specs))]
+        app = self.app()
+        before = encode(self.store.load())
+        async with app.run_test(size=(80, 24)) as pilot:
+            form = await self.sheet(app, pilot)
+            reply = form.query_one('#decision-other-reply-0', Collapsible)
+            title = reply.query_one('CollapsibleTitle')
+            title.scroll_visible(top=True, animate=False)
+            title.focus()
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            intent = form.query_one('#intent-0', Select)
+            intent.scroll_visible(top=True, animate=False)
+            intent.focus()
+            await pilot.pause()
+            await pilot.press('enter', 'down', 'down', 'enter')
+            await wait_ui(pilot, lambda: intent.value == 'feedback')
+            form.query_one('#comment-0', TextArea).text = '仅核对已有证据\n不授权执行或预算'
+            await pilot.pause()
+            answers, values, snapshot = form.answers(), form.edit_values(), form.report_view
+            title.scroll_visible(top=True, animate=False)
+            title.focus()
+            await pilot.pause()
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertTrue(reply.collapsed)
+            expected = preview_decisions(app.board, self.task.id, answers, Target('saved'))
+            review = await self.review(app, pilot, 'saved')
+            self.assertEqual(review.preview, expected)
+            self.assertIs(review.report_view, snapshot)
+            self.assertEqual(form.edit_values(), values)
+            await pilot.press('escape')
+            await wait_ui(pilot, lambda: app.screen is form and not form.busy)
+            self.assertTrue(reply.collapsed)
+            overview = form.query_one('#decision-overview')
+            for size in ((40, 18), (130, 40), (80, 24)):
+                await pilot.resize_terminal(*size)
+                await pilot.pause()
+                overview.focus()
+                await pilot.pause()
+                await pilot.press('down')
+                await wait_ui(pilot, lambda: form.selected_index == 1)
+                self.assertTrue(form.query_one('#decision-other-reply-1', Collapsible).collapsed)
+                await pilot.press('up')
+                await wait_ui(pilot, lambda: form.selected_index == 0)
+                self.assertTrue(reply.collapsed)
+                self.assertEqual(form.answers(), answers)
+                self.assertEqual(form.edit_values(), values)
+                self.assertEqual(form.report_view, snapshot)
+                self.assertEqual(preview_decisions(app.board, self.task.id, form.answers(), Target('saved')), expected)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.endpoint.glob('commands/*.json')))
+
+    async def test_known_inline_errors_remain_expanded_for_keyboard_validation_without_changing_input(self):
+        app = self.app()
+        before = encode(self.store.load())
+        async with app.run_test(size=(40, 18)) as pilot:
+            form = await self.sheet(app, pilot)
+            original = form.report_view
+            container = form.query_one('#decision-other-reply-0', Collapsible)
+            form.query_one('#intent-0', Select).value = 'fact'
+            form.query_one('#business-choice-0', Select).value = 'conditional'
+            await pilot.pause()
+            self.assertFalse(container.collapsed)
+            container.collapsed = True
+            await pilot.pause()
+            self.assertFalse(container.collapsed)
+            await pilot.press('ctrl+enter')
+            await pilot.pause()
+            self.assertIn('条件', str(form.query_one('#decision-error', Static).content))
+            self.assertEqual(form.query_one('#business-choice-0', Select).value, 'conditional')
+            form.query_one('#intent-0', Select).value = 'feedback'
+            text = '保留完整原文' * 101
+            form.query_one('#comment-0', TextArea).text = text
+            await pilot.pause()
+            self.assertFalse(container.collapsed)
+            container.collapsed = True
+            await pilot.pause()
+            self.assertFalse(container.collapsed)
+            await pilot.press('ctrl+enter')
+            await pilot.pause()
+            self.assertIn('500', str(form.query_one('#decision-error', Static).content))
+            self.assertEqual(form.query_one('#comment-0', TextArea).text, text)
+            self.assertIn('答复待校验，不会提交', str(form.query_one('#decision-reply-status-0', Static).content))
+            self.assertEqual(form.report_view, original)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.endpoint.glob('commands/*.json')))
+
+    async def test_saved_draft_restores_expanded_reply_and_business_values_without_new_authority(self):
+        self.seed_fixture()
+        original = deepcopy(asdict(self.source_run))
+        answer = Answer(business=BusinessAnswer('conditional', '仅在虚构原件核对完成后'))
+        prepare_decision_intent(self.board, preview_decisions(self.board, self.task.id, (answer,), Target('draft')))
+        self.store.save(self.board)
+        for size in ((40, 18), (80, 24), (130, 40)):
+            with self.subTest(size=size):
+                app = self.app()
+                before = encode(self.store.load())
+                async with app.run_test(size=size) as pilot:
+                    form = await self.sheet(app, pilot)
+                    self.assertTrue(form.has_draft)
+                    self.assertFalse(form.query_one('#decision-other-reply-0', Collapsible).collapsed)
+                    self.assertEqual(form.answers(), (answer,))
+                    form.reveal_reply(0, 'business-detail-0')
+                    detail = form.query_one('#business-detail-0')
+                    await wait_ui(pilot, lambda detail=detail: detail.has_focus, timeout=2)
+                    self.assertTrue(detail.has_focus)
+                    self.assertTrue(form.query_one('#decision-body', VerticalScroll).content_region.contains_region(detail.region))
+                    frame = ''.join(strip.text for strip in form._compositor.render_strips())
+                    self.assertIn('虚构原件', frame)
+                    self.assertEqual(asdict(app.board.runs[self.source_run.id]), original)
+                    self.assertEqual(encode(self.store.load()), before)
+                    self.assertFalse(list(self.endpoint.glob('commands/*.json')))
+
+    async def test_reply_shortcut_layout_callback_is_inert_after_busy_page_change_or_close(self):
+        app = self.app()
+        before = encode(self.store.load())
+        async with app.run_test(size=(40, 18)) as pilot:
+            form = await self.sheet(app, pilot)
+            form.query_one('#intent-0', Select).value = 'feedback'
+            await pilot.pause()
+            overview = form.query_one('#decision-overview')
+            overview.focus()
+            await pilot.pause()
+            form.reveal_reply(0, 'comment-0')
+            form.busy = True
+            await pilot.pause()
+            self.assertIs(form.focused, overview)
+            form.busy = False
+            form.reveal_reply(0, 'comment-0')
+            modal = Confirm('合成页面', '页面切换后不抢焦点', '返回')
+            app.push_screen(modal)
+            await pilot.pause()
+            focused = app.focused
+            await pilot.pause()
+            self.assertIs(app.screen, modal)
+            self.assertIs(app.focused, focused)
+            modal.dismiss(False)
+            await pilot.pause()
+            form.reveal_reply(0, 'comment-0')
+            form.dismiss(None)
+            await pilot.pause()
+            self.assertIsNot(app.screen, form)
+            self.assertEqual(encode(self.store.load()), before)
+            self.assertFalse(list(self.endpoint.glob('commands/*.json')))
 
     async def test_sheet_actions_name_whole_sheet_and_review_names_receiver(self):
         app = self.app()
@@ -293,6 +507,8 @@ class IntentUI(unittest.IsolatedAsyncioTestCase):
             explanation = '未选择的条目不会发送；选择类型不等于保存或发送。'
             guide = next(widget for widget in form.query('.decision-meta').results(Static)
                          if str(widget.content) == explanation)
+            form.query_one('#decision-other-reply-0', Collapsible).collapsed = False
+            await pilot.pause()
             guide.scroll_visible(top=True, animate=False)
             await pilot.pause()
             rendered = ''.join(strip.text.strip() for strip in guide.render_lines(guide.region.size.region))

@@ -65,6 +65,14 @@ export function validateEvents(values: string[], runId: string, seq: number) {
     if (origins.length > 1 || origins.some(event => event.source !== "system")) throw new Error("Conflicting original session location.");
     const parents = events.filter(event => event.kind === "continued");
     if (parents.length > 1 || parents.some(event => event.source !== "system" || !uuid(event.text) || event.text === runId)) throw new Error("Invalid continuation parent.");
+    const adopted = events.filter(event => event.kind === "adopted");
+    if (adopted.length > 1 || (adopted.length && parents.length)) throw new Error("Conflicting adoption origin.");
+    for (const event of adopted) {
+        const source = object(parseStrictJSON(event.text), ["adoption_id", "parent_run_id", "source_digest"]);
+        if (event.source !== "system" || !uuid(source.adoption_id) || (source.parent_run_id !== "" && !uuid(source.parent_run_id)) ||
+            source.parent_run_id === runId || !text(source.source_digest, 64) || Boolean(source.parent_run_id) !== Boolean(source.source_digest) ||
+            (source.source_digest && !/^[0-9a-f]{64}$/.test(source.source_digest))) throw new Error("Invalid adoption origin.");
+    }
 }
 function encoded(kind: string, body: string, runId: string, seq: number, report: Report | null): string {
     const event: KeyEvent = { id: randomUUID(), at: new Date().toISOString(), kind, source: report ? "executor" : "system",
@@ -80,7 +88,7 @@ export function appendKeyEvent(values: string[], kind: string, body: string, run
     let gap = entries.find(entry => entry.event?.kind === "history_gap")?.raw;
     const kept = entries.filter(entry => entry.event?.kind !== "history_gap");
     const latestReport = [...kept].reverse().find(entry => entry.event?.report)?.raw;
-    const protectedItems = new Set([value, latestReport, ...kept.filter(entry => ["origin", "continued"].includes(entry.event?.kind || "")).map(entry => entry.raw)]);
+    const protectedItems = new Set([value, latestReport, ...kept.filter(entry => ["origin", "continued", "adopted"].includes(entry.event?.kind || "")).map(entry => entry.raw)]);
     while (true) {
         const result = [...(gap ? [gap] : []), ...kept.map(entry => entry.raw)];
         if (result.length <= MAX_EVENTS && bytes(result) <= MAX_BYTES) return result;

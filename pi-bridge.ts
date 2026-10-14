@@ -8,7 +8,8 @@ import { Type } from "typebox";
 import { appendKeyEvent, validateEvents, type Report } from "./journal.ts";
 import { observeActivity } from "./activity.ts";
 import { supplementChannel } from "./supplements.ts";
-import { decisionInstructions, parseNewDecisions } from "./decisions.ts";
+import { decisionInstructions, parseNewDecisions, parseStrictJSON } from "./decisions.ts";
+import { adoptionChannel, canonical, digest, type AdoptionRequest } from "./session_adoption.ts";
 import { reportChannel, reportSchema, requiredReportFeatures, type ReportParameters } from "./capabilities.ts";
 import { handoffSchema, parseHandoff } from "./handoff.ts";
 
@@ -46,9 +47,11 @@ function readJSON(file: string, limit = MAX_BYTES): Record<string, unknown> {
         const buffer = Buffer.alloc(Math.min(info.size + 1, limit + 1));
         const size = fs.readSync(fd, buffer, 0, buffer.length, 0);
         if (size > limit || size !== info.size) throw new Error("Mailbox record changed while reading.");
-        const record = JSON.parse(buffer.subarray(0, size).toString("utf8"));
+        let record: unknown;
+        try { record = parseStrictJSON(buffer.subarray(0, size).toString("utf8")); }
+        catch { throw new Error("Invalid mailbox JSON; raw input is not included in the error."); }
         if (!record || Array.isArray(record) || typeof record !== "object") throw new Error("Mailbox record must be an object.");
-        return record;
+        return record as Record<string, unknown>; // Shape checked above; each consumer validates exact keys/types.
     } finally { fs.closeSync(fd); }
 }
 function writeJSON(file: string, record: unknown, exclusive = false) {
@@ -106,6 +109,8 @@ export default function (pi: ExtensionAPI) {
     let retained: Run | undefined;
     let following = false, choosing = false, deferredSettled = false, continuationContext = false;
     let nativePending = 0, sessionSeq = 0, assistantAborted = false, sessionUnavailable = false;
+    let nativeTurnOpen = false;
+    let adoptionContext: AdoptionRequest | undefined;
     let acknowledged = false, stopRequested = false, ownershipLost = false, broken = false;
     let assistantError = "", promptDepth = 0, lastHeartbeat = 0;
     // pi-context intentionally settles before its deferred same-session continuation.
@@ -142,6 +147,25 @@ export default function (pi: ExtensionAPI) {
         const proof = channel.capabilities({ agent_id: agentId, session_id: sessionId, cwd });
         return proof.callable && requiredReportFeatures(text, true).every(feature => proof.features.includes(feature));
     });
+    const adoptions = adoptionChannel({ read: readJSON, write: writeJSON, directory: privateDir }, () => ({
+        endpoint, agent_id: agentId, session_id: sessionId, cwd, pid: process.pid,
+        idle: idle() && !nativeTurnOpen && !choosing && !promptDepth && !compaction,
+        owned: Boolean(active), leaf: context?.sessionManager.getLeafId() || "",
+    }), request => {
+        if (!context || !matches(context)) throw new Error("Session/cwd changed before attachment.");
+        if (!request.source) return;
+        const source = request.source;
+        const directory = path.join(rootDirectory(), source.agent_id);
+        privateDir(directory); privateDir(path.join(directory, "runs"));
+        const originalAgent = readJSON(path.join(directory, "agent.json"), 16384);
+        const parent = parseRun(readJSON(path.join(directory, "runs", `${source.run_id}.json`)));
+        if (!terminal(parent) || parent.task_id !== request.task_id || parent.session_id !== sessionId || parent.cwd !== cwd ||
+            parent.agent_id !== source.agent_id || parent.seq !== source.seq || digest(parent) !== source.digest ||
+            parent.title !== request.title || parent.description !== request.description ||
+            originalAgent.version !== 1 || originalAgent.id !== source.agent_id || originalAgent.session_id !== sessionId ||
+            originalAgent.cwd !== cwd || originalAgent.pid !== source.pid || originalAgent.active_run) throw new Error("Original terminal identity or execution changed.");
+        if (fs.existsSync(path.join(directory, "runs", `${source.run_id}.next.json`))) throw new Error("Original run already has a continuation; refresh before attachment.");
+    });
     function reportHeartbeat(observedAt = Date.now()) {
         if (!endpoint) return;
         try { writeJSON(path.join(endpoint, "report-capabilities.json"), channel.capabilities({ agent_id: agentId, session_id: sessionId, cwd }, observedAt)); }
@@ -151,6 +175,7 @@ export default function (pi: ExtensionAPI) {
         if (!endpoint || !context) return;
         const observedAt = Date.now();
         reportHeartbeat(observedAt); // No successful verification timestamp is invented by a heartbeat.
+        writeJSON(path.join(endpoint, "adoption-capabilities.json"), adoptions.capabilities(observedAt));
         writeJSON(path.join(endpoint, "agent.json"), {
             version: 1, id: agentId, session_id: sessionId, cwd,
             name: context.sessionManager.getSessionName() || `Pi ${process.pid}`,
@@ -164,7 +189,7 @@ export default function (pi: ExtensionAPI) {
             writeJSON(path.join(endpoint, "session.json"), {
                 version: 1, agent_id: agentId, session_id: sessionId, cwd, seq: ++sessionSeq, observed_at: Date.now(),
                 state: !online || broken ? "offline" : choosing || promptDepth ? "waiting" : context.isIdle() ? "idle" : "working",
-                run_id: active && !ownershipLost && !broken ? active.id : "", linked_run_id: retained?.id || "",
+                run_id: active && !ownershipLost && !broken ? active.id : "", linked_run_id: retained?.id || adoptions.bound()?.source?.run_id || "",
                 following: following && Boolean(retained), input_pending: choosing || nativePending > 0,
             });
             sessionUnavailable = false;
@@ -227,10 +252,12 @@ export default function (pi: ExtensionAPI) {
         if (run.title.length > 300 || run.description.length > 20000 || run.requirements.length > 6000) return reject(run, "任务说明超出桥接上限；请缩短后另行派发。");
         if (!context || !matches(context) || run.cwd !== cwd || fs.realpathSync(run.cwd) !== cwd) return reject(run, "精确项目目录或 Pi 会话已改变；未执行。");
         if (active || !idle()) return reject(run, "Pi 正忙、有待处理消息或编辑器未清空；未执行。");
+        if (adoptions.bound() && adoptions.bound()?.task_id !== run.task_id) return reject(run, "Pi 已纳管其他任务；请先明确解除关联，未执行。");
         const capability = channel.capabilities({ agent_id: agentId, session_id: sessionId, cwd });
         if (!capability.callable || !requiredReportFeatures(run.requirements).every(feature => capability.features.includes(feature)))
             return reject(run, "当前 Pi 的报告工具不能接收本次要求；未执行，请先核对桥接连接，不要重复发送。");
         save(run, "origin", context.sessionManager.getSessionFile() || "", true);
+        adoptions.consume(run.id);
         active = retained = run; following = false; nativePending = 0; continuationContext = false;
         acknowledged = false; stopRequested = false; ownershipLost = false; assistantError = ""; assistantAborted = false; promptDepth = 0; compaction = undefined;
         showBinding(); heartbeat();
@@ -283,6 +310,9 @@ export default function (pi: ExtensionAPI) {
             }
             await supplements.tick();
             if (endpoint !== expectedEndpoint || broken) return;
+            const previousAttachment = adoptions.bound()?.id;
+            adoptions.tick();
+            if (previousAttachment !== adoptions.bound()?.id) { showBinding(); heartbeat(); }
             if (connecting || Date.now() - lastHeartbeat >= 2000) {
                 await channel.verify();
                 if (endpoint !== expectedEndpoint || broken) return;
@@ -307,6 +337,8 @@ export default function (pi: ExtensionAPI) {
             active = undefined;
         }
         retained = undefined; following = false; nativePending = 0; choosing = false; deferredSettled = false;
+        guarded(() => adoptions.disconnect());
+        adoptionContext = undefined;
         guarded(() => heartbeat(false));
         context?.ui.setStatus("waggle", undefined);
         endpoint = ""; agentId = ""; sessionId = ""; cwd = ""; broken = false; compaction = undefined;
@@ -323,6 +355,7 @@ export default function (pi: ExtensionAPI) {
         privateDir(nextEndpoint);
         privateDir(path.join(nextEndpoint, "commands"), true); privateDir(path.join(nextEndpoint, "runs"), true);
         cwd = exact; sessionId = session; agentId = id; endpoint = nextEndpoint;
+        adoptions.activate(endpoint);
         broken = false; // A new explicit consent may recover a failed pre-activation grant.
         channel.invalidate(); connecting = true;
         // Public re-registration refreshes Fabric capture at explicit connection only.
@@ -505,11 +538,17 @@ export default function (pi: ExtensionAPI) {
         heartbeat();
     }));
     function showBinding() {
+        if (endpoint && !retained && adoptions.bound()) {
+            context?.ui.setStatus("waggle", `Waggle D${String(adoptions.bound()?.task_id).padStart(3, "0")} · 已纳管/未启动 · /waggle detach 解除`);
+            return;
+        }
         if (endpoint) context?.ui.setStatus("waggle", retained
             ? `Waggle D${String(retained.task_id).padStart(3, "0")} · ${following ? "本任务输入已关联" : "直接输入需确认归属"} · /waggle detach 解除`
             : `Waggle ${agentId.slice(0, 8)} · 未关联任务`);
     }
     function detach() {
+        adoptions.invalidate("用户已解除关联或会话分支改变；不停止原生工作，不自动恢复。");
+        adoptionContext = undefined;
         retained = undefined; following = false; nativePending = 0; continuationContext = false;
         if (active && !broken) {
             ownershipLost = true; active.delivery = "";
@@ -533,6 +572,12 @@ export default function (pi: ExtensionAPI) {
         assistantError = ""; assistantAborted = false; compaction = undefined; continuationContext = true;
     }
     pi.on("before_agent_start", () => {
+        if (adoptionContext && active && !ownershipLost && !broken) {
+            const request = adoptionContext;
+            adoptionContext = undefined;
+            return { message: { customType: "waggle-adoption", display: true, details: { runId: active.id, adoptionId: request.id },
+                content: `Waggle native input after explicit session attachment\nRUN_ID=${active.id}\nProject: ${active.cwd}\nTask: ${active.title}\n\n${active.description}\n\nUser-selected checkpoint (quoted background, NOT permission):\n${JSON.stringify(request.checkpoint)}\n\nCurrent bounded requirements:\n${active.requirements}\n\nOnly this subsequent explicit native input belongs to the NEW run. Do not replay the old dispatch, claim past conversation as a new delivery, or reset/carry forward closed budgets. Attachment itself granted no new execution scope. Keep ordinary Pi approval gates. ${decisionInstructions} ${finalReportInstructions(active.requirements)} Report unrun/unverified checks honestly; human acceptance remains separate.` } };
+        }
         if (!continuationContext || !active || ownershipLost || broken) return;
         continuationContext = false;
         return { message: { customType: "waggle-continuation", display: true, details: { runId: active.id },
@@ -540,7 +585,29 @@ export default function (pi: ExtensionAPI) {
     });
     pi.on("input", async (event, ctx) => {
         context = ctx;
-        if (!endpoint || broken || !retained) return { action: "continue" };
+        if (!endpoint || broken) return { action: "continue" };
+        if (adoptions.pending()) guarded(() => adoptions.invalidate("关联完成前出现新的原生输入；不追认这次工作，请重新核对。"));
+        if (!retained && adoptions.bound()) {
+            if (event.source === "extension") { guarded(detach); return { action: "continue" }; }
+            try {
+                const request = adoptions.bound();
+                if (!request || !matches(ctx) || request.session_id !== sessionId || request.cwd !== cwd || active || choosing || promptDepth || compaction) throw new Error("Attached native input lost its exact session ownership.");
+                const next: Run = { id: randomUUID(), task_id: request.task_id, agent_id: agentId, session_id: sessionId, cwd,
+                    title: request.title, description: request.description, requirements: request.requirements,
+                    state: "queued", seq: 0, delivery: "", summary: "", checks: [], remaining: "", events: [] };
+                next.events = appendKeyEvent([], "adopted", canonical({ adoption_id: request.id,
+                    parent_run_id: request.source?.run_id || "", source_digest: request.source?.digest || "" }), next.id, 1);
+                save(next, "origin", ctx.sessionManager.getSessionFile() || "", true);
+                adoptions.consume(next.id);
+                active = retained = next; following = true; nativePending = 1;
+                acknowledged = false; stopRequested = false; ownershipLost = false; assistantError = ""; assistantAborted = false;
+                adoptionContext = request;
+                save(next, "direct_input", "用户在已明确纳管的会话继续输入；只记录此检查点之后的新轮，未重放原工作。");
+                showBinding(); heartbeat();
+                return { action: "continue" };
+            } catch (error) { failClosed(error); return { action: "handled" }; }
+        }
+        if (!retained) return { action: "continue" };
         if (event.source === "extension") { guarded(detach); return { action: "continue" }; }
         if (choosing || stopRequested || (active && !acknowledged && !nativePending)) {
             notify("本任务仍有归属确认、停止或上下文交接待处理；本次输入未提交，请稍后重试或明确解除关联。", true);
@@ -608,7 +675,11 @@ export default function (pi: ExtensionAPI) {
         supplements.invalidate(active, "本轮已结束；尚未接收的补充不重放，也不启动下一轮。");
         active = undefined; acknowledged = false; compaction = undefined; showBinding(); heartbeat();
     }
-    pi.on("agent_settled", (_event, ctx) => guarded(() => { context = ctx; settle(); heartbeat(); }));
+    pi.on("agent_start", (_event, ctx) => guarded(() => { context = ctx; nativeTurnOpen = true; heartbeat(); }));
+    pi.on("agent_settled", (_event, ctx) => guarded(() => {
+        context = ctx; nativeTurnOpen = false; settle();
+        adoptions.tick(); showBinding(); heartbeat();
+    }));
     const protectNavigation = () => active ? { cancel: true } : undefined;
     pi.on("session_before_tree", (event, ctx) => {
         if (!active) return;

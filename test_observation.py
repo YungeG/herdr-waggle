@@ -18,6 +18,7 @@ from runtime import BridgeError, Runtime, private_dir, publish, read_json
 from store import StorageError, Store
 from task_context import WorkContract
 from test_activity import activity_record
+from test_capabilities import capability_record
 from test_runtime import prepared_board
 
 
@@ -123,6 +124,8 @@ class ObservationTests(unittest.TestCase):
         self.assertTrue(self.runtime.read_agent(other).available)
         self.assertEqual(self.runtime.discover(), [self.runtime.agent(other.agent_id)])
         private_dir(native_endpoint / "commands", create=True)
+        # This unrelated native fixture must meet the existing v2 report-channel gate.
+        publish(native_endpoint / "report-capabilities.json", capability_record(self.runtime.agent(other.agent_id)))
         self.runtime.dispatch(other)
         self.assertEqual(len(list((native_endpoint / "commands").iterdir())), 1)
         self.assertFalse((self.endpoint / "commands").exists())
